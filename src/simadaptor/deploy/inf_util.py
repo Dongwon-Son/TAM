@@ -36,6 +36,31 @@ _ADAPTOR_FLAG_JOINTWISE_DIRECT_RESIDUAL_HEAD = 1 << 3
 _ADAPTOR_FLAG_COMMAND_CONDITIONED_HEAD = 1 << 4
 
 
+class _OnlineDaggerConfigCompat:
+    """Stable target for legacy ``__main__.OnlineDaggerConfig`` pickles.
+
+    Online DAgger checkpoints were written while the trainer was executed as a
+    script, so pickle recorded the config class under ``__main__``.  Deployment
+    entrypoints have a different ``__main__`` module and otherwise cannot load
+    those checkpoints.  The config is metadata-only at inference time, so a
+    state-compatible attribute container is sufficient and keeps the original
+    values available for checkpoint-driven deployment decisions.
+    """
+
+
+class _CheckpointMetadataUnpickler(pickle.Unpickler):
+    def find_class(self, module: str, name: str):
+        if name == "OnlineDaggerConfig" and (
+            module in ("__main__", "__main___impl")
+            or module == "train_tam_online_dagger"
+            or module.endswith(".train_tam_online_dagger")
+            or module == "dagger_finetune_impl"
+            or module.endswith("dagger_finetune_impl")
+        ):
+            return _OnlineDaggerConfigCompat
+        return super().find_class(module, name)
+
+
 def _load_viser_util():
     raise RuntimeError(
         "Viser visualization support is not included in the minimal TAM release."
@@ -60,6 +85,42 @@ def _checkpoint_step_from_dir_name(path: Path) -> int | None:
         return int(name.split("_", 1)[1])
     except ValueError:
         return None
+
+
+_LEGACY_TAM_CFG_FIELD_MAP = (
+    ("adaptor_hidden", "tam_hidden"),
+    ("adaptor_depth", "tam_depth"),
+    ("adaptor_seq_length", "tam_seq_length"),
+)
+
+_COMPATIBLE_CHECKPOINT_ABLATION_MODES = ("tam", "full_mam")
+
+
+def _migrate_legacy_cfg_fields(cfg_obj: object) -> None:
+    """Promote raw pickled legacy field values on restored checkpoint configs.
+
+    Configs pickled before the tam_* field rename carry their trained values in
+    the instance __dict__ under the legacy names, where the class-level compat
+    properties shadow them on attribute access. Copy them into the live tam_*
+    fields so model construction sees the trained values instead of class
+    defaults, and reject checkpoints whose raw training mode is incompatible
+    with public TAM inference.
+    """
+    inst = getattr(cfg_obj, "__dict__", None)
+    if not isinstance(inst, dict):
+        return
+    for legacy_name, field_name in _LEGACY_TAM_CFG_FIELD_MAP:
+        if legacy_name in inst and field_name not in inst:
+            try:
+                setattr(cfg_obj, field_name, int(inst[legacy_name]))
+            except (TypeError, ValueError):
+                pass
+    raw_mode = inst.get("ablation_mode")
+    if raw_mode is not None and str(raw_mode) not in _COMPATIBLE_CHECKPOINT_ABLATION_MODES:
+        raise ValueError(
+            "Public TAM inference supports only TAM checkpoints; this checkpoint "
+            f"was trained with ablation_mode={str(raw_mode)!r}."
+        )
 
 
 def _backfill_missing_cfg_fields(cfg_obj: object, defaults: object) -> None:
@@ -175,7 +236,7 @@ class SimAdaptorInference:
     def _load_save_dict_payload(ckpt_dir: Path) -> dict:
         save_dict_path = ckpt_dir / "save_dict.pkl"
         with open(save_dict_path, "rb") as f:
-            return pickle.load(f)
+            return _CheckpointMetadataUnpickler(f).load()
 
     @staticmethod
     def _restore_flax_checkpoint(ckpt_path: Path):
@@ -287,6 +348,7 @@ class SimAdaptorInference:
         )
 
         self._cfg = None
+        self._checkpoint_metadata_payload = {}
         self._simadaptor_model = None
         self._simadaptor_params = None
         self._norm_stats = None
@@ -305,6 +367,7 @@ class SimAdaptorInference:
         if self._ckpt_path is not None:
             if (self._ckpt_path / "save_dict.pkl").exists():
                 loaded = self._load_save_dict_payload(self._ckpt_path)
+                self._checkpoint_metadata_payload = dict(loaded)
                 simadaptor_params = loaded["params"]
                 self._norm_stats = loaded.get("norm_stats")
                 cfg = loaded["cfg"]
@@ -317,6 +380,7 @@ class SimAdaptorInference:
                         "or keep the checkpoint inside its original run folder."
                     )
                 metadata_loaded = self._load_save_dict_payload(self._ckpt_metadata_path)
+                self._checkpoint_metadata_payload = dict(metadata_loaded)
                 restored = self._restore_flax_checkpoint(self._ckpt_path)
                 simadaptor_params = _extract_restored_field(restored, "params")
                 if simadaptor_params is None:
@@ -350,6 +414,7 @@ class SimAdaptorInference:
                     _backfill_missing_cfg_fields(cfg, TrainConfig())
                 except Exception as exc:
                     print(f"[SimAdaptorInference] Warning: failed to backfill checkpoint config fields ({exc})")
+            _migrate_legacy_cfg_fields(cfg)
             self._cfg = cfg
             print(f"[SimAdaptorInference] Config: {cfg}")
             if self._norm_stats is None:
@@ -511,6 +576,18 @@ class SimAdaptorInference:
     @property
     def cfg(self):
         return self._cfg
+
+    @property
+    def checkpoint_metadata(self) -> dict:
+        """Return the run-level checkpoint metadata loaded from ``save_dict.pkl``."""
+
+        return dict(self._checkpoint_metadata_payload)
+
+    @property
+    def dagger_cfg(self):
+        """Return online-DAgger metadata when the checkpoint provides it."""
+
+        return self._checkpoint_metadata_payload.get("dagger_cfg")
 
     @property
     def xml_path(self) -> str:

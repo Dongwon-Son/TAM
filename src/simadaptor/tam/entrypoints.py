@@ -230,6 +230,70 @@ def train_robot(argv: Sequence[str] | None = None) -> None:
     _run_script("scripts/train/tam/train.py", forwarded)
 
 
+def dagger_finetune(argv: Sequence[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(
+        description="Online DAgger-style finetuning of a trained TAM checkpoint.",
+    )
+    parser.add_argument(
+        "--ckpt",
+        required=True,
+        help="Base TAM checkpoint (run directory containing save_dict.pkl).",
+    )
+    parser.add_argument(
+        "--robot-preset",
+        default="panda_pandagripper",
+        help=f"Robot preset providing the XML and datagen profile. Choices: {robot_choices_help()}",
+    )
+    parser.add_argument(
+        "--history-torque-mode",
+        default="base_tam_fusion",
+        choices=("applied", "base_tam_fusion"),
+        help="Online torque-history conditioning: applied-torque only, or fused applied/base/TAM-residual streams.",
+    )
+    parser.add_argument(
+        "--attention-history-s",
+        type=float,
+        default=None,
+        help="Optional bounded attention history window in seconds.",
+    )
+    parser.add_argument("--steps", type=int, default=None, help="Number of finetuning steps.")
+    parser.add_argument("--wandb-mode", default="disabled", choices=("online", "offline", "disabled"))
+    parser.add_argument("--outdir", default="checkpoints/tam_online_dagger")
+    parser.add_argument(
+        "--extra",
+        default="",
+        help="Quoted extra args forwarded to scripts/train/tam/dagger_finetune.py.",
+    )
+    parser.add_argument("--dry-run", action="store_true", help="Print the generated command without running it.")
+    args = parser.parse_args(list(argv) if argv is not None else None)
+
+    preset = resolve_robot(args.robot_preset)
+    forwarded = [
+        "--ckpt",
+        str(args.ckpt),
+        "--xml",
+        str(preset.xml_path),
+        "--profile-key",
+        preset.profile_key,
+        "--history-torque-mode",
+        str(args.history_torque_mode),
+        "--wandb-mode",
+        str(args.wandb_mode),
+        "--workdir",
+        str(args.outdir),
+    ]
+    if args.attention_history_s is not None:
+        forwarded.extend(["--attention-history-s", str(args.attention_history_s)])
+    if args.steps is not None:
+        forwarded.extend(["--max-steps", str(args.steps)])
+    forwarded.extend(_split_extra(args.extra))
+    if args.dry_run:
+        print("python scripts/train/tam/dagger_finetune.py " + shlex.join(forwarded))
+        return
+    print(f"[tam-dagger-finetune] robot={preset.key} ckpt={args.ckpt}")
+    _run_script("scripts/train/tam/dagger_finetune.py", forwarded)
+
+
 def mapping_server(argv: Sequence[str] | None = None) -> None:
     forwarded = list(sys.argv[1:] if argv is None else argv)
     if not _has_flag(forwarded, "--backend"):
@@ -247,7 +311,7 @@ def eval_source_to_osc_sim(argv: Sequence[str] | None = None) -> None:
     )
     parser.add_argument("--robot-preset", default="panda")
     parser.add_argument("--conditions", nargs="+", default=["direct_osc", "tam_carried"])
-    parser.add_argument("--sim-backend", default="batched", choices=("auto", "legacy", "batched"))
+    parser.add_argument("--sim-backend", default="auto", choices=("auto", "legacy", "batched"))
     parser.add_argument("--num-iterations", type=int, default=8)
     parser.add_argument("--outdir", type=Path, default=Path("eval_logs") / "source_to_osc_tam_sim")
     parser.add_argument("--tam-ckpt-path", type=Path, default=None)
@@ -260,13 +324,19 @@ def eval_source_to_osc_sim(argv: Sequence[str] | None = None) -> None:
     )
     args = parser.parse_args(list(argv) if argv is not None else None)
 
+    sim_backend = str(args.sim_backend)
+    if sim_backend == "auto" and args.source_only:
+        # The experiment's auto backend resolution only inspects condition keys
+        # and would pick the batched table backend for the default conditions,
+        # but the batched backend does not implement --source-only.
+        sim_backend = "legacy"
     forwarded = [
         "--robot-preset",
         str(args.robot_preset),
         "--conditions",
         *list(args.conditions),
         "--sim-backend",
-        str(args.sim_backend),
+        sim_backend,
         "--num-iterations",
         str(args.num_iterations),
         "--outdir",

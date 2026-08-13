@@ -40,6 +40,14 @@ class OnlineHistoryRuntimeConfig:
     patch_stride: int
     context_half: int
     decode_patch_size: int
+    # Historical name: this is a temporal-patch count and is passed to the
+    # offline transformer's train_window_override.
+    attention_history_tokens: int | None
+    # Actual flattened KV-cache budget (temporal patches × DoF for jointwise).
+    attention_history_cache_tokens: int | None
+    cache_tokens_per_history_step: int
+    use_rope: bool
+    rope_base: float
     arm_dof: int
     emb_dim: int
     jointwise: bool
@@ -92,6 +100,160 @@ def push_window(window: jax.Array, new_val: jax.Array) -> jax.Array:
     return jnp.concatenate([window[1:], new_val[None, ...]], axis=0)
 
 
+def attention_history_tokens_from_seconds(
+    history_s: float | None,
+    sample_dt_s: float | None,
+    *,
+    decode_patch_size: int,
+    patch_stride: int,
+) -> int | None:
+    """Convert a raw-sample history horizon into temporal history patches."""
+    if history_s is None or float(history_s) <= 0.0:
+        return None
+    if sample_dt_s is None or float(sample_dt_s) <= 0.0:
+        raise ValueError("sample_dt_s must be positive when attention history is bounded.")
+    decode_patch_size = max(int(decode_patch_size), 1)
+    patch_stride = max(int(patch_stride), 1)
+    history_samples = max(int(round(float(history_s) / float(sample_dt_s))), 1)
+    if history_samples <= decode_patch_size:
+        history_steps = 1
+    else:
+        history_steps = max(1, 1 + (history_samples - decode_patch_size) // patch_stride)
+    return history_steps
+
+
+def _cache_sequence_axis(arr: jax.Array) -> int:
+    if arr.ndim < 3:
+        raise ValueError(f"Expected a cached key/value with rank >= 3, got shape={arr.shape}.")
+    return arr.ndim - 3
+
+
+def _drop_oldest_cache_tokens(arr: jax.Array, count: int) -> jax.Array:
+    seq_axis = _cache_sequence_axis(arr)
+    seq_len = int(arr.shape[seq_axis])
+    count = min(max(int(count), 1), seq_len)
+    if count >= seq_len:
+        return jnp.zeros_like(arr)
+    tail = jnp.take(arr, jnp.arange(count, seq_len, dtype=jnp.int32), axis=seq_axis)
+    pad = jnp.take(
+        jnp.zeros_like(arr),
+        jnp.arange(count, dtype=jnp.int32),
+        axis=seq_axis,
+    )
+    return jnp.concatenate([tail, pad], axis=seq_axis)
+
+
+def _rebase_rope_cached_key(
+    cached_key: jax.Array,
+    *,
+    dropped_tokens: int,
+    rope_base: float,
+) -> jax.Array:
+    """Move already-RoPE-rotated keys back by ``dropped_tokens`` positions."""
+
+    head_dim = int(cached_key.shape[-1])
+    if head_dim % 2:
+        raise ValueError(f"RoPE cached-key head dimension must be even, got {head_dim}.")
+    half = head_dim // 2
+    inv_freq = 1.0 / (
+        float(rope_base)
+        ** (jnp.arange(half, dtype=jnp.float32) / max(half, 1))
+    )
+    angle = -float(dropped_tokens) * inv_freq
+    cos = jnp.cos(angle).astype(cached_key.dtype)
+    sin = jnp.sin(angle).astype(cached_key.dtype)
+    even = cached_key[..., ::2]
+    odd = cached_key[..., 1::2]
+    rebased_even = even * cos - odd * sin
+    rebased_odd = even * sin + odd * cos
+    return jnp.reshape(
+        jnp.stack([rebased_even, rebased_odd], axis=-1),
+        cached_key.shape,
+    )
+
+
+def limit_decode_cache_attention_window(
+    cache: Any,
+    keep_tokens: int | None,
+    *,
+    append_tokens: int = 1,
+    rebase_rope: bool = False,
+    rope_base: float = 10000.0,
+) -> Any:
+    """Keep a fixed-size sliding token window in mutable Transformer decode caches.
+
+    The cache shape stays unchanged for JIT compatibility. Once a cache leaf has
+    insufficient room for the next decode chunk, that many oldest entries are
+    shifted out and the chunk writes into the newly opened slots.  Jointwise
+    models must pass ``append_tokens=DoF`` because one temporal patch appends one
+    cache token per joint.
+
+    RoPE keys are stored after positional rotation.  When ``rebase_rope`` is
+    true, shifted keys are counter-rotated by the number of dropped positions so
+    their relative positions remain correct after the sliding-window rebase.
+    """
+    if keep_tokens is None:
+        return cache
+    keep_tokens = int(keep_tokens)
+    if keep_tokens <= 0:
+        return cache
+    append_tokens = max(int(append_tokens), 1)
+
+    def visit(node):
+        if not isinstance(node, Mapping):
+            return node
+        if {"cached_key", "cached_value", "cache_index"}.issubset(node.keys()):
+            cached_key = node["cached_key"]
+            cached_value = node["cached_value"]
+            cache_index = node["cache_index"]
+            capacity = int(cached_key.shape[_cache_sequence_axis(cached_key)])
+            keep = max(keep_tokens, 1)
+            if keep > capacity:
+                raise ValueError(
+                    f"Requested cache window {keep} exceeds cache capacity {capacity}."
+                )
+            if append_tokens > keep:
+                raise ValueError(
+                    f"append_tokens={append_tokens} exceeds keep_tokens={keep}."
+                )
+            if keep % append_tokens:
+                raise ValueError(
+                    "keep_tokens must be an integer number of decode chunks: "
+                    f"keep_tokens={keep}, append_tokens={append_tokens}."
+                )
+            drop = append_tokens
+
+            def shifted():
+                out = dict(node)
+                shifted_key = _drop_oldest_cache_tokens(cached_key, drop)
+                # Current RoPE attention caches carry an absolute position
+                # counter, so shifted keys keep their original rotation and
+                # need no lossy repeated counter-rotation. Keep the fallback
+                # for legacy/custom cache structures without that counter.
+                if rebase_rope and "cache_rope_index" not in node:
+                    shifted_key = _rebase_rope_cached_key(
+                        shifted_key,
+                        dropped_tokens=drop,
+                        rope_base=rope_base,
+                    )
+                out["cached_key"] = shifted_key
+                out["cached_value"] = _drop_oldest_cache_tokens(cached_value, drop)
+                out["cache_index"] = jnp.maximum(
+                    jnp.asarray(cache_index) - drop,
+                    0,
+                ).astype(jnp.asarray(cache_index).dtype)
+                return out
+
+            def unchanged():
+                return dict(node)
+
+            should_shift = jnp.all(jnp.asarray(cache_index) + append_tokens > keep)
+            return jax.lax.cond(should_shift, shifted, unchanged)
+        return {key: visit(value) for key, value in node.items()}
+
+    return visit(cache)
+
+
 def zero_torque_history_keep_mask(
     raw_tau: jax.Array,
     *,
@@ -136,6 +298,8 @@ def build_online_history_runtime(
     params_hist_example,
     emb_dim: int,
     arm_dof: int,
+    attention_history_s: float | None = None,
+    sample_dt_s: float | None = None,
 ) -> OnlineHistoryRuntime:
     hist_cfg = getattr(hist_model, "cfg", hist_model)
     patch_size = int(getattr(hist_cfg, "patch_size"))
@@ -145,11 +309,30 @@ def build_online_history_runtime(
     )
     context_half = masked_fit_half if masked_fit_half > 0 else 0
     decode_patch_size = patch_size + 2 * context_half if context_half > 0 else patch_size
+    cache_tokens_per_history_step = int(arm_dof)
+    use_rope = bool(getattr(hist_cfg, "use_RoPE", True))
+    rope_base = float(getattr(hist_cfg, "rope_base", 10000.0))
+    attention_history_tokens = attention_history_tokens_from_seconds(
+        attention_history_s,
+        sample_dt_s,
+        decode_patch_size=decode_patch_size,
+        patch_stride=patch_stride,
+    )
+    attention_history_cache_tokens = (
+        None
+        if attention_history_tokens is None
+        else int(attention_history_tokens) * cache_tokens_per_history_step
+    )
     cfg = OnlineHistoryRuntimeConfig(
         patch_size=patch_size,
         patch_stride=patch_stride,
         context_half=context_half,
         decode_patch_size=decode_patch_size,
+        attention_history_tokens=attention_history_tokens,
+        attention_history_cache_tokens=attention_history_cache_tokens,
+        cache_tokens_per_history_step=cache_tokens_per_history_step,
+        use_rope=use_rope,
+        rope_base=rope_base,
         arm_dof=int(arm_dof),
         emb_dim=int(emb_dim),
         jointwise=True,
@@ -171,6 +354,13 @@ def build_online_history_runtime(
         norm_stats,
     ):
         valid_mask = jnp.ones(q_patch.shape[:2], dtype=jnp.float32)
+        cache = limit_decode_cache_attention_window(
+            cache,
+            attention_history_cache_tokens,
+            append_tokens=cache_tokens_per_history_step,
+            rebase_rope=use_rope,
+            rope_base=rope_base,
+        )
         emb, cache_out = models_transformer.step_decode(
             params=params_hist,
             cache=cache,

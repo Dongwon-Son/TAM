@@ -30,6 +30,7 @@ dependencies = [
 tam-generate-data = "simadaptor.tam.entrypoints:generate_data"
 tam-train-multi-robot = "simadaptor.tam.entrypoints:train_multi_robot"
 tam-train-robot = "simadaptor.tam.entrypoints:train_robot"
+tam-dagger-finetune = "simadaptor.tam.entrypoints:dagger_finetune"
 tam-mapping-server = "simadaptor.tam.entrypoints:mapping_server"
 tam-eval-wrapper = "simadaptor.tam.entrypoints:eval_wrapper"
 tam-eval-source-to-osc-sim = "simadaptor.tam.entrypoints:eval_source_to_osc_sim"

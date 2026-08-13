@@ -42,6 +42,32 @@ except Exception:  # pragma: no cover
     tty = None
 
 
+DEFAULT_DEPLOY_ATTENTION_HISTORY_S = 4.0
+HISTORY_TORQUE_MODE_AUTO = "auto"
+HISTORY_TORQUE_MODE_APPLIED = "applied"
+HISTORY_TORQUE_MODE_BASE_TAM_FUSION = "base_tam_fusion"
+HISTORY_TORQUE_MODE_CHOICES = (
+    HISTORY_TORQUE_MODE_AUTO,
+    HISTORY_TORQUE_MODE_APPLIED,
+    HISTORY_TORQUE_MODE_BASE_TAM_FUSION,
+)
+_APPLIED_TAU_KEYS = ("tau_applied", "tau_cmd", "tau_commanded", "tau", "u_des", "u", "tau_measured")
+_BASE_TAU_KEYS = (
+    "tau_base",
+    "tau_base_cmd",
+    "base_tau",
+    "base_tau_cmd",
+    "tau_plain",
+    "tau_nominal",
+    "tau_policy",
+    "tau_without_adaptor",
+)
+_TAM_RESIDUAL_TAU_KEYS = (
+    "tau_tam_residual",
+    "tam_residual",
+    "tau_adaptor_delta",
+    "tau_delta",
+)
 _REMOTE_PREPARE_RETRY_INTERVAL_S = 0.5
 _HOLD_RESEND_INTERVAL_S = 0.2
 
@@ -68,6 +94,85 @@ def _simadaptor_ablation_mode(adaptor: Any) -> str:
     inf = getattr(adaptor, "inf", None)
     cfg = getattr(inf, "cfg", None)
     return str(getattr(cfg, "ablation_mode", "tam") or "tam").strip() or "tam"
+
+
+def _simadaptor_config_history_torque_mode(adaptor: Any) -> str:
+    inf = getattr(adaptor, "inf", None)
+    dagger_cfg = getattr(inf, "dagger_cfg", None)
+    dagger_mode = getattr(dagger_cfg, "history_torque_mode", None)
+    if dagger_mode:
+        return str(dagger_mode).strip()
+    cfg = getattr(inf, "cfg", None)
+    cfg_mode = getattr(cfg, "history_torque_mode", None)
+    if cfg_mode:
+        return str(cfg_mode).strip()
+    if _simadaptor_has_history_fusion(adaptor):
+        return HISTORY_TORQUE_MODE_BASE_TAM_FUSION
+    return HISTORY_TORQUE_MODE_APPLIED
+
+
+def _simadaptor_dagger_config(adaptor: Any) -> Any:
+    inf = getattr(adaptor, "inf", None)
+    return getattr(inf, "dagger_cfg", None)
+
+
+def _simadaptor_has_history_fusion(adaptor: Any) -> bool:
+    inf = getattr(adaptor, "inf", None)
+    params = getattr(inf, "_simadaptor_params", {}) or {}
+    try:
+        return "history_fusion" in params
+    except Exception:
+        return False
+
+
+def _simadaptor_history_fusion_params(adaptor: Any) -> Any:
+    inf = getattr(adaptor, "inf", None)
+    params = getattr(inf, "_simadaptor_params", {}) or {}
+    try:
+        return params["history_fusion"]
+    except Exception as exc:
+        raise RuntimeError(
+            "Checkpoint requested base_tam_fusion history, but history_fusion "
+            "parameters are missing."
+        ) from exc
+
+
+def _resolve_simadaptor_history_torque_mode(adaptor: Any, requested: str) -> str:
+    requested = str(requested or HISTORY_TORQUE_MODE_AUTO).strip()
+    if requested not in HISTORY_TORQUE_MODE_CHOICES:
+        raise ValueError(
+            f"Unsupported history torque mode {requested!r}; "
+            f"choose one of {HISTORY_TORQUE_MODE_CHOICES}."
+        )
+    cfg_mode = _simadaptor_config_history_torque_mode(adaptor)
+    mode = cfg_mode if requested == HISTORY_TORQUE_MODE_AUTO else requested
+    if mode == HISTORY_TORQUE_MODE_BASE_TAM_FUSION:
+        if not _simadaptor_has_history_fusion(adaptor):
+            raise RuntimeError(
+                "base_tam_fusion history requires checkpoint params['history_fusion']; "
+                f"checkpoint history_torque_mode={cfg_mode!r} but no fusion weights were found."
+            )
+        return HISTORY_TORQUE_MODE_BASE_TAM_FUSION
+    return HISTORY_TORQUE_MODE_APPLIED
+
+
+def _apply_history_fusion(
+    fusion_params: Any,
+    history_emb_applied: Any,
+    history_emb_base: Any,
+    history_emb_tam: Any,
+) -> Any:
+    import jax.numpy as jnp
+
+    x = jnp.concatenate(
+        [
+            jnp.asarray(history_emb_applied, dtype=jnp.float32),
+            jnp.asarray(history_emb_base, dtype=jnp.float32),
+            jnp.asarray(history_emb_tam, dtype=jnp.float32),
+        ],
+        axis=-1,
+    )
+    return jnp.einsum("...i,ij->...j", x, fusion_params["kernel"]) + fusion_params["bias"]
 
 
 def _format_age_s(age_s: Optional[float]) -> str:
@@ -194,6 +299,7 @@ def _simadaptor_checkpoint_meta(
 ) -> dict[str, Any]:
     inf = adaptor.inf
     cfg = getattr(inf, "cfg", None)
+    dagger_cfg = _simadaptor_dagger_config(adaptor)
     ckpt_cfg = _cfg_value(cfg, "ckpt", None)
     data = _cfg_value(cfg, "data", None)
 
@@ -214,8 +320,28 @@ def _simadaptor_checkpoint_meta(
         "xml_path": _jsonable_path(getattr(inf, "xml_path", None)),
         "model_head": _describe_simadaptor_head(cfg, inf),
         "ablation_mode": _cfg_value(cfg, "ablation_mode", None),
+        "cfg_history_torque_mode": _cfg_value(cfg, "history_torque_mode", None),
+        "dagger_history_torque_mode": _cfg_value(
+            dagger_cfg,
+            "history_torque_mode",
+            None,
+        ),
+        "dagger_attention_history_s": _cfg_value(
+            dagger_cfg,
+            "attention_history_s",
+            None,
+        ),
+        "resolved_history_torque_mode": getattr(
+            args,
+            "resolved_history_torque_mode",
+            None,
+        ),
         "emb_dim": _cfg_value(cfg, "emb_dim", None),
         "ideal_model_contract": "public_tam_real_gravity",
+        "attention_history_s": getattr(args, "attention_history_s", None),
+        "require_explicit_fused_history": bool(
+            getattr(args, "require_explicit_fused_history", True)
+        ),
         "bin_name": bin_name,
         "bin_base64_bytes": int(len(bin_b64 or "")),
     }
@@ -230,6 +356,7 @@ def _print_simadaptor_deploy_config(
 ) -> None:
     inf = adaptor.inf
     cfg = getattr(inf, "cfg", None)
+    dagger_cfg = _simadaptor_dagger_config(adaptor)
     enc = _cfg_value(cfg, "enc", None)
     data = _cfg_value(cfg, "data", None)
     ckpt_cfg = _cfg_value(cfg, "ckpt", None)
@@ -258,6 +385,17 @@ def _print_simadaptor_deploy_config(
             dof=getattr(adaptor, "_dof", "n/a"),
             tam_head="jointwise_residual",
             head=_describe_simadaptor_head(cfg, inf),
+            cfg_history_torque_mode=_cfg_value(cfg, "history_torque_mode"),
+            dagger_history_torque_mode=_cfg_value(
+                dagger_cfg,
+                "history_torque_mode",
+            ),
+            resolved_history_torque_mode=getattr(
+                args,
+                "resolved_history_torque_mode",
+                "n/a",
+            ),
+            has_history_fusion="history_fusion" in (getattr(inf, "_simadaptor_params", {}) or {}),
             emb_dim=_cfg_value(cfg, "emb_dim"),
             hidden=_cfg_value(cfg, "adaptor_hidden"),
             depth=_cfg_value(cfg, "adaptor_depth"),
@@ -297,6 +435,22 @@ def _print_simadaptor_deploy_config(
             patch_stride=getattr(adaptor, "_patch_stride", "n/a"),
             decode_patch_size=getattr(adaptor, "_decode_patch_size", "n/a"),
             context_half=getattr(adaptor, "_context_half", "n/a"),
+            attention_history_s=getattr(args, "attention_history_s", None),
+            dagger_attention_history_s=_cfg_value(
+                dagger_cfg,
+                "attention_history_s",
+            ),
+            attention_history_tokens=getattr(adaptor, "_attention_history_tokens", "n/a"),
+            attention_history_cache_tokens=getattr(
+                adaptor,
+                "_attention_history_cache_tokens",
+                "n/a",
+            ),
+            require_explicit_fused_history=getattr(
+                args,
+                "require_explicit_fused_history",
+                True,
+            ),
             smoothing=getattr(adaptor, "_history_smoothing", "masked_local_fit"),
             jax_cache_dir=getattr(adaptor, "_jax_cache_dir", None) or "disabled",
             jax_cache_min_compile_time_s=args.history_jax_cache_min_compile_time_s,
@@ -425,6 +579,142 @@ def _window_to_arrays(window: Sequence[dict]) -> Optional[tuple[np.ndarray, ...]
     )
 
 
+@dataclass(frozen=True)
+class FusedHistoryWindowArrays:
+    t: np.ndarray
+    q: np.ndarray
+    dq: np.ndarray
+    tau_applied: np.ndarray
+    tau_base: np.ndarray
+    tau_tam: np.ndarray
+    gravity: Optional[np.ndarray]
+    keep: Optional[np.ndarray]
+    source_labels: tuple[str, ...]
+    missing_delta_rows: int
+
+
+def _first_history_array(
+    sample: dict,
+    keys: Sequence[str],
+    *,
+    dof: int,
+) -> Optional[np.ndarray]:
+    for key in keys:
+        if key not in sample or sample[key] is None:
+            continue
+        arr = np.asarray(sample[key], dtype=np.float32).reshape(-1)
+        if arr.size >= int(dof):
+            return arr[: int(dof)]
+    return None
+
+
+def _history_sample_timestamp(sample: dict) -> Optional[float]:
+    for key in ("t", "t_raw", "timestamp"):
+        if key not in sample or sample[key] is None:
+            continue
+        try:
+            return float(sample[key])
+        except Exception:
+            continue
+    return None
+
+
+def _history_sample_keep(sample: dict) -> tuple[float, bool]:
+    for key in ("valid_for_history",):
+        if key in sample and sample[key] is not None:
+            return (1.0 if bool(sample[key]) else 0.0), True
+    return 1.0, False
+
+
+def _derive_base_tam_torques(
+    sample: dict,
+    tau_applied: np.ndarray,
+    *,
+    dof: int,
+) -> tuple[np.ndarray, np.ndarray, str, bool]:
+    tau_base = _first_history_array(sample, _BASE_TAU_KEYS, dof=dof)
+    tau_tam = _first_history_array(sample, _TAM_RESIDUAL_TAU_KEYS, dof=dof)
+    applied = np.asarray(tau_applied, dtype=np.float32).reshape(int(dof))
+    if tau_base is not None and tau_tam is not None:
+        if sample.get("publish_ready") is True:
+            return tau_base, tau_tam, "explicit_base_and_tam", False
+        return tau_base, tau_tam, "explicit_base_and_tam_unverified", False
+    if tau_tam is not None:
+        return applied - tau_tam, tau_tam, "applied_minus_tam_delta", False
+    if tau_base is not None:
+        return tau_base, applied - tau_base, "applied_minus_explicit_base", False
+    return applied.copy(), np.zeros_like(applied), "missing_delta_zero", True
+
+
+def _window_to_fused_history_arrays(
+    window: Sequence[dict],
+    *,
+    dof: int = 7,
+) -> Optional[FusedHistoryWindowArrays]:
+    ts_list: list[float] = []
+    q_list: list[np.ndarray] = []
+    dq_list: list[np.ndarray] = []
+    tau_applied_list: list[np.ndarray] = []
+    tau_base_list: list[np.ndarray] = []
+    tau_tam_list: list[np.ndarray] = []
+    gravity_list: list[np.ndarray] = []
+    keep_list: list[float] = []
+    source_labels: list[str] = []
+    have_all_gravity = True
+    have_any_keep = False
+    missing_delta_rows = 0
+
+    for sample in window:
+        if not isinstance(sample, dict):
+            continue
+        t = _history_sample_timestamp(sample)
+        if t is None:
+            continue
+        q = _first_history_array(sample, ("q", "qpos"), dof=dof)
+        dq = _first_history_array(sample, ("dq", "qd", "qvel"), dof=dof)
+        tau_applied = _first_history_array(sample, _APPLIED_TAU_KEYS, dof=dof)
+        if q is None or dq is None or tau_applied is None:
+            continue
+        tau_base, tau_tam, source_label, missing_delta = _derive_base_tam_torques(
+            sample,
+            tau_applied,
+            dof=dof,
+        )
+        gravity = _first_history_array(sample, ("gravity",), dof=dof)
+        keep_value, has_keep = _history_sample_keep(sample)
+
+        ts_list.append(float(t))
+        q_list.append(q)
+        dq_list.append(dq)
+        tau_applied_list.append(tau_applied)
+        tau_base_list.append(tau_base)
+        tau_tam_list.append(tau_tam)
+        keep_list.append(float(keep_value))
+        source_labels.append(source_label)
+        missing_delta_rows += int(missing_delta)
+        have_any_keep = have_any_keep or has_keep
+        if gravity is None:
+            have_all_gravity = False
+            gravity_list.append(np.zeros((int(dof),), dtype=np.float32))
+        else:
+            gravity_list.append(gravity)
+
+    if not ts_list:
+        return None
+    return FusedHistoryWindowArrays(
+        t=np.asarray(ts_list, dtype=np.float64),
+        q=np.asarray(q_list, dtype=np.float32),
+        dq=np.asarray(dq_list, dtype=np.float32),
+        tau_applied=np.asarray(tau_applied_list, dtype=np.float32),
+        tau_base=np.asarray(tau_base_list, dtype=np.float32),
+        tau_tam=np.asarray(tau_tam_list, dtype=np.float32),
+        gravity=np.asarray(gravity_list, dtype=np.float32) if have_all_gravity else None,
+        keep=np.asarray(keep_list, dtype=np.float32) if have_any_keep else None,
+        source_labels=tuple(source_labels),
+        missing_delta_rows=int(missing_delta_rows),
+    )
+
+
 def _sync_controller_ideal_model_has_gravity(
     client: HistoryControllerClient,
     enabled: bool,
@@ -494,10 +784,10 @@ def _describe_adaptor_bin_blob(bin_b64: str) -> str:
 
 def _adaptor_bin_rejection_hint() -> str:
     return (
-        "This usually means the controller-side panda_py/pandapy_dw build is "
-        "stale for this TAM bin layout. Rebuild/reinstall ../pandapy_dw "
-        "on the NUC from a version that supports command-conditioned/jointwise "
-        "v2 adaptor bins, then restart scripts/history_controller.py."
+        "This usually means the controller-side history publisher build is "
+        "stale for this TAM bin layout. Rebuild it from a version that "
+        "supports command-conditioned/jointwise v2 adaptor bins, then "
+        "restart the controller-side bridge."
     )
 
 
@@ -624,6 +914,11 @@ class SimAdaptorMappingUpdater:
     reset_on_controller_reset: bool
     print_embedding: bool
     ideal_model_has_gravity: bool
+    history_torque_mode: str = HISTORY_TORQUE_MODE_APPLIED
+    base_history_adaptor: Any | None = None
+    tam_history_adaptor: Any | None = None
+    history_fusion_params: Any | None = None
+    require_explicit_fused_history: bool = True
     require_control_enable: bool = False
     bin_name: Optional[str] = None
     bin_b64: Optional[str] = None
@@ -648,6 +943,13 @@ class SimAdaptorMappingUpdater:
     current_embedding: Optional[np.ndarray] = None
     enable_hold_until_wall: Optional[float] = None
     bin_uploaded_once: bool = False
+    fused_windows: int = 0
+    fused_missing_delta_rows: int = 0
+    fused_rejected_windows: int = 0
+    fused_source_counts: dict[str, int] = field(default_factory=dict)
+    fused_contract_valid: Optional[bool] = None
+    warned_missing_fused_delta: bool = False
+    warned_nonexplicit_fused_history: bool = False
 
     def __post_init__(self) -> None:
         self.embedding_interval_s = float(self.embedding_interval_s)
@@ -661,6 +963,25 @@ class SimAdaptorMappingUpdater:
         self.reset_on_controller_reset = bool(self.reset_on_controller_reset)
         self.print_embedding = bool(self.print_embedding)
         self.ideal_model_has_gravity = bool(self.ideal_model_has_gravity)
+        self.require_explicit_fused_history = bool(self.require_explicit_fused_history)
+        self.history_torque_mode = str(
+            self.history_torque_mode or HISTORY_TORQUE_MODE_APPLIED
+        ).strip()
+        if self.history_torque_mode not in (
+            HISTORY_TORQUE_MODE_APPLIED,
+            HISTORY_TORQUE_MODE_BASE_TAM_FUSION,
+        ):
+            raise ValueError(
+                "history_torque_mode must be 'applied' or 'base_tam_fusion', "
+                f"got {self.history_torque_mode!r}."
+            )
+        if self.history_torque_mode == HISTORY_TORQUE_MODE_BASE_TAM_FUSION:
+            if self.base_history_adaptor is None or self.tam_history_adaptor is None:
+                raise ValueError(
+                    "base_tam_fusion requires base_history_adaptor and tam_history_adaptor."
+                )
+            if self.history_fusion_params is None:
+                raise ValueError("base_tam_fusion requires history_fusion_params.")
         self.require_control_enable = bool(self.require_control_enable)
         self.control_enable_allowed = not self.require_control_enable
         self.enabled = self.control_enable_allowed and not self.delay_enable
@@ -796,6 +1117,31 @@ class SimAdaptorMappingUpdater:
         self.remote_prepare_failed = False
         self.remote_prepare_error = None
 
+    def _invalidate_fused_history_contract(self) -> None:
+        """Disable stale output and require a fresh fused context after a bad row."""
+        if self.fused_contract_valid is False:
+            return
+        self.fused_contract_valid = False
+        self.adaptor.reset()
+        if self.base_history_adaptor is not None:
+            self.base_history_adaptor.reset()
+        if self.tam_history_adaptor is not None:
+            self.tam_history_adaptor.reset()
+        self.last_embedding_wall = None
+        self.last_send_wall = None
+        self.patches_since_reset = 0
+        self.num_emb = 0
+        self.num_sent = 0
+        self.pending_embedding = None
+        self.current_embedding = None
+        _set_adaptor_enabled(
+            self.client,
+            False,
+            reliable=True,
+            log_prefix="[mapping_server]",
+        )
+        self.enabled = False
+
     def _record_permanent_prepare_failure(self, exc: Exception) -> None:
         self.pending_remote_prepare = False
         self.last_prepare_attempt_wall = None
@@ -851,6 +1197,10 @@ class SimAdaptorMappingUpdater:
         if not self.reset_on_controller_reset:
             return
         self.adaptor.reset()
+        if self.base_history_adaptor is not None:
+            self.base_history_adaptor.reset()
+        if self.tam_history_adaptor is not None:
+            self.tam_history_adaptor.reset()
         self.last_window_wall = None
         self.last_valid_wall = None
         self.last_embedding_wall = None
@@ -876,6 +1226,99 @@ class SimAdaptorMappingUpdater:
         self.last_prepare_attempt_wall = None
         self.remote_prepare_failed = False
         self.remote_prepare_error = None
+        self.fused_contract_valid = None
+
+    def _push_applied_history_window(
+        self,
+        *,
+        timestamps: np.ndarray,
+        q: np.ndarray,
+        dq: np.ndarray,
+        tau: np.ndarray,
+        gravity: Optional[np.ndarray],
+        keep_mask: Optional[np.ndarray],
+    ) -> Any | None:
+        return self.adaptor.push_window(
+            timestamps,
+            q,
+            dq,
+            tau,
+            gravity=gravity,
+            keep_mask=keep_mask,
+        )
+
+    def _push_fused_history_window(
+        self,
+        fused: FusedHistoryWindowArrays,
+        *,
+        now: float,
+    ) -> Any | None:
+        del now
+        self.fused_windows += 1
+        self.fused_missing_delta_rows += int(fused.missing_delta_rows)
+        for label in fused.source_labels:
+            self.fused_source_counts[str(label)] = (
+                int(self.fused_source_counts.get(str(label), 0)) + 1
+            )
+        nonexplicit_rows = sum(
+            1 for label in fused.source_labels if label != "explicit_base_and_tam"
+        )
+        if self.require_explicit_fused_history and nonexplicit_rows > 0:
+            self.fused_rejected_windows += 1
+            self._invalidate_fused_history_contract()
+            if not self.warned_nonexplicit_fused_history:
+                print(
+                    "[mapping_server] Refusing fused history until the controller-side "
+                    "history publisher provides publish-ready rows with explicit "
+                    "tau_base and tau_adaptor_delta fields: "
+                    f"nonexplicit_rows={nonexplicit_rows}/{len(fused.source_labels)} "
+                    f"sources={dict(self.fused_source_counts)}."
+                )
+                self.warned_nonexplicit_fused_history = True
+            return None
+        self.fused_contract_valid = True
+        if fused.missing_delta_rows > 0 and not self.warned_missing_fused_delta:
+            print(
+                "[mapping_server] base_tam_fusion history: "
+                f"{int(fused.missing_delta_rows)} row(s) in the first fused window "
+                "had no TAM residual field; using zero residual for those rows."
+            )
+            self.warned_missing_fused_delta = True
+        applied_emb = self.adaptor.push_window(
+            fused.t,
+            fused.q,
+            fused.dq,
+            fused.tau_applied,
+            gravity=fused.gravity,
+            raw_tau=fused.tau_applied,
+            keep_mask=fused.keep,
+        )
+        base_emb = self.base_history_adaptor.push_window(
+            fused.t,
+            fused.q,
+            fused.dq,
+            fused.tau_base,
+            gravity=fused.gravity,
+            raw_tau=fused.tau_applied,
+            keep_mask=fused.keep,
+        )
+        tam_emb = self.tam_history_adaptor.push_window(
+            fused.t,
+            fused.q,
+            fused.dq,
+            fused.tau_tam,
+            tau_is_model_space=True,
+            raw_tau=fused.tau_applied,
+            keep_mask=fused.keep,
+        )
+        if applied_emb is None or base_emb is None or tam_emb is None:
+            return None
+        return _apply_history_fusion(
+            self.history_fusion_params,
+            applied_emb,
+            base_emb,
+            tam_emb,
+        )
 
     def handle_window(
         self,
@@ -907,30 +1350,59 @@ class SimAdaptorMappingUpdater:
         self.num_windows += 1
         self.last_window_wall = now
 
-        arrays = _window_to_arrays(window)
-        if arrays is None:
-            self.last_controller_time = latest_controller_time
-            return False
+        fused_arrays: Optional[FusedHistoryWindowArrays] = None
+        if self.history_torque_mode == HISTORY_TORQUE_MODE_BASE_TAM_FUSION:
+            fused_arrays = _window_to_fused_history_arrays(window)
+            if fused_arrays is None:
+                self.last_controller_time = latest_controller_time
+                return False
+            t_arr = fused_arrays.t
+            q_arr = fused_arrays.q
+            dq_arr = fused_arrays.dq
+            tau_arr = fused_arrays.tau_applied
+            gravity_arr = fused_arrays.gravity
+            keep_arr = fused_arrays.keep
+        else:
+            arrays = _window_to_arrays(window)
+            if arrays is None:
+                self.last_controller_time = latest_controller_time
+                return False
 
-        t_arr, q_arr, dq_arr, tau_arr, gravity_arr, keep_arr = arrays
+            t_arr, q_arr, dq_arr, tau_arr, gravity_arr, keep_arr = arrays
         if self.num_valid == 0:
             print(
                 "[mapping_server] First valid history samples received: "
-                f"{t_arr.shape[0]} rows with q/dq/tau."
+                f"{t_arr.shape[0]} rows with q/dq/tau "
+                f"(history_torque_mode={self.history_torque_mode})."
             )
         self.num_valid += int(t_arr.shape[0])
         self.last_valid_wall = now
         self._maybe_prepare_remote_controller(now=now)
 
         t_used = (float(now) + (t_arr - t_arr[-1])).astype(np.float64)
-        emb = self.adaptor.push_window(
-            t_used,
-            q_arr,
-            dq_arr,
-            tau_arr,
-            gravity=gravity_arr,
-            keep_mask=keep_arr,
-        )
+        if fused_arrays is not None:
+            fused_arrays = FusedHistoryWindowArrays(
+                t=t_used,
+                q=fused_arrays.q,
+                dq=fused_arrays.dq,
+                tau_applied=fused_arrays.tau_applied,
+                tau_base=fused_arrays.tau_base,
+                tau_tam=fused_arrays.tau_tam,
+                gravity=fused_arrays.gravity,
+                keep=fused_arrays.keep,
+                source_labels=fused_arrays.source_labels,
+                missing_delta_rows=fused_arrays.missing_delta_rows,
+            )
+            emb = self._push_fused_history_window(fused_arrays, now=now)
+        else:
+            emb = self._push_applied_history_window(
+                timestamps=t_used,
+                q=q_arr,
+                dq=dq_arr,
+                tau=tau_arr,
+                gravity=gravity_arr,
+                keep_mask=keep_arr,
+            )
         if emb is not None:
             emb_np = np.asarray(emb, dtype=np.float32)
             if self.num_emb == 0:
@@ -1086,6 +1558,12 @@ class SimAdaptorMappingUpdater:
             health = "stalled_no_recent_history"
         elif self.num_valid == 0:
             health = "history_missing_keys"
+        elif (
+            self.history_torque_mode == HISTORY_TORQUE_MODE_BASE_TAM_FUSION
+            and self.require_explicit_fused_history
+            and self.fused_contract_valid is False
+        ):
+            health = "fused_history_contract_missing"
         elif self.last_embedding_wall is None:
             health = "collecting_context"
         elif self.patches_since_reset < self.min_patches_before_send:
@@ -1104,6 +1582,13 @@ class SimAdaptorMappingUpdater:
             "configured_mapping_mode": MAPPING_MODE_SIMADAPTOR,
             "backend": "tam",
             "tam_checkpoint": dict(self.simadaptor_checkpoint),
+            "history_torque_mode": str(self.history_torque_mode),
+            "fused_windows": int(self.fused_windows),
+            "fused_missing_delta_rows": int(self.fused_missing_delta_rows),
+            "fused_rejected_windows": int(self.fused_rejected_windows),
+            "fused_contract_valid": self.fused_contract_valid,
+            "fused_source_counts": dict(self.fused_source_counts),
+            "require_explicit_fused_history": bool(self.require_explicit_fused_history),
             "health": health,
             "windows": int(self.num_windows),
             "valid_samples": int(self.num_valid),
@@ -1148,6 +1633,7 @@ class SimAdaptorMappingUpdater:
             f"embeddings={status['embeddings']} "
             f"sent={status['sent']} "
             f"enabled={'yes' if status['enabled'] else 'no'} "
+            f"history_torque_mode={status['history_torque_mode']} "
             f"patches={status['patches_since_reset']}/{status['min_patches_before_send']} "
             f"last_window={status['last_window_age']} "
             f"last_valid={status['last_valid_age']} "
@@ -1294,6 +1780,36 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Fallback dt (s) for the runtime adaptor.",
     )
     parser.add_argument(
+        "--attention-history-s",
+        type=float,
+        default=DEFAULT_DEPLOY_ATTENTION_HISTORY_S,
+        help=(
+            "Limit autoregressive history attention to this many seconds. "
+            f"Default: {DEFAULT_DEPLOY_ATTENTION_HISTORY_S:g}; <=0 keeps the full cache."
+        ),
+    )
+    parser.add_argument(
+        "--history-torque-mode",
+        type=str,
+        default=HISTORY_TORQUE_MODE_AUTO,
+        choices=HISTORY_TORQUE_MODE_CHOICES,
+        help=(
+            "History torque contract for TAM checkpoints. 'auto' first reads "
+            "online-DAgger metadata, then base config metadata, and finally infers "
+            "base_tam_fusion from checkpoint history_fusion weights."
+        ),
+    )
+    parser.add_argument(
+        "--require-explicit-fused-history",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "For base_tam_fusion checkpoints, require every controller history row "
+            "to publish explicit tau_base and tau_adaptor_delta fields before sending "
+            "or enabling an embedding."
+        ),
+    )
+    parser.add_argument(
         "--history-jax-cache-dir",
         type=Path,
         default=Path(".cache") / "jax_history_compile",
@@ -1406,6 +1922,7 @@ def _build_updater(
             simadaptor_ckpt_path=str(args.ckpt_path) if args.ckpt_path is not None else None,
             xml_path=args.xml,
             expected_dt=float(args.expected_dt),
+            attention_history_s=args.attention_history_s,
             jax_cache_dir=args.history_jax_cache_dir,
             jax_cache_min_compile_time_s=float(args.history_jax_cache_min_compile_time_s),
             jax_cache_min_entry_size_bytes=int(args.history_jax_cache_min_entry_size_bytes),
@@ -1415,6 +1932,11 @@ def _build_updater(
                 else None
             ),
         )
+        resolved_history_torque_mode = _resolve_simadaptor_history_torque_mode(
+            adaptor,
+            str(args.history_torque_mode),
+        )
+        args.resolved_history_torque_mode = resolved_history_torque_mode
         ablation_mode = _simadaptor_ablation_mode(adaptor)
         if ablation_mode != "tam":
             raise RuntimeError(
@@ -1443,6 +1965,39 @@ def _build_updater(
             bin_name=bin_name,
             bin_b64=bin_b64,
         )
+        base_history_adaptor = None
+        tam_history_adaptor = None
+        history_fusion_params = None
+        if resolved_history_torque_mode == HISTORY_TORQUE_MODE_BASE_TAM_FUSION:
+            history_fusion_params = _simadaptor_history_fusion_params(adaptor)
+            base_history_adaptor = RealTimeHistoryAdaptor(
+                sim_inf=adaptor.inf,
+                runtime_bundle=adaptor.runtime_bundle,
+                expected_dt=float(args.expected_dt),
+                attention_history_s=args.attention_history_s,
+                jax_cache_dir=args.history_jax_cache_dir,
+                jax_cache_min_compile_time_s=float(args.history_jax_cache_min_compile_time_s),
+                jax_cache_min_entry_size_bytes=int(args.history_jax_cache_min_entry_size_bytes),
+                jax_cache_xla_caches=(
+                    str(args.history_jax_cache_xla_caches)
+                    if args.history_jax_cache_xla_caches
+                    else None
+                ),
+            )
+            tam_history_adaptor = RealTimeHistoryAdaptor(
+                sim_inf=adaptor.inf,
+                runtime_bundle=adaptor.runtime_bundle,
+                expected_dt=float(args.expected_dt),
+                attention_history_s=args.attention_history_s,
+                jax_cache_dir=args.history_jax_cache_dir,
+                jax_cache_min_compile_time_s=float(args.history_jax_cache_min_compile_time_s),
+                jax_cache_min_entry_size_bytes=int(args.history_jax_cache_min_entry_size_bytes),
+                jax_cache_xla_caches=(
+                    str(args.history_jax_cache_xla_caches)
+                    if args.history_jax_cache_xla_caches
+                    else None
+                ),
+            )
         return SimAdaptorMappingUpdater(
             client=client,
             adaptor=adaptor,
@@ -1452,6 +2007,11 @@ def _build_updater(
             reset_on_controller_reset=bool(args.reset_on_controller_reset),
             print_embedding=bool(args.print_embedding),
             ideal_model_has_gravity=bool(adaptor.inf.ideal_model_has_gravity),
+            history_torque_mode=resolved_history_torque_mode,
+            base_history_adaptor=base_history_adaptor,
+            tam_history_adaptor=tam_history_adaptor,
+            history_fusion_params=history_fusion_params,
+            require_explicit_fused_history=bool(args.require_explicit_fused_history),
             require_control_enable=bool(args.require_control_enable),
             bin_name=bin_name,
             bin_b64=bin_b64,
@@ -1607,6 +2167,9 @@ def _apply_control_enable_delay(
 def main(argv: Optional[Sequence[str]] = None) -> None:
     parser = build_arg_parser()
     args = parser.parse_args(list(argv) if argv is not None else None)
+    if args.attention_history_s is not None and args.attention_history_s <= 0:
+        # Documented escape hatch: values <= 0 keep the full decode cache.
+        args.attention_history_s = None
 
     client = HistoryControllerClient(
         history_endpoint=args.history_endpoint,

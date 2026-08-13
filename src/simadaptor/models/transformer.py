@@ -120,6 +120,28 @@ def apply_rope_qk(x, cos_half, sin_half, positions):
     )
 
 
+def apply_rope_qk_at_positions(x, positions, base: float = 10000.0):
+    """Apply RoPE at arbitrary (including decode-stream absolute) positions."""
+    head_dim = int(x.shape[-1])
+    if head_dim % 2:
+        raise ValueError(f"RoPE head dimension must be even, got {head_dim}.")
+    half = head_dim // 2
+    inv = 1.0 / (
+        float(base) ** (jnp.arange(half, dtype=jnp.float32) / max(half, 1))
+    )
+    angle = jnp.asarray(positions, dtype=jnp.float32)[:, None] * inv[None, :]
+    cos_t = jnp.cos(angle).astype(x.dtype)[None, :, None, :]
+    sin_t = jnp.sin(angle).astype(x.dtype)[None, :, None, :]
+    x_even = x[..., ::2]
+    x_odd = x[..., 1::2]
+    rotated_even = x_even * cos_t - x_odd * sin_t
+    rotated_odd = x_even * sin_t + x_odd * cos_t
+    return jnp.reshape(
+        jnp.stack([rotated_even, rotated_odd], axis=-1),
+        x.shape,
+    )
+
+
 class RoPESelfAttention(nn.Module):
     d_model: int
     num_heads: int
@@ -160,13 +182,19 @@ class RoPESelfAttention(nn.Module):
                                     lambda: jnp.zeros((B, self.rope_max_len, H, Hd), x.dtype))
             idx_var = self.variable("cache", "cache_index",
                                     lambda: jnp.array(0, dtype=jnp.int32))
+            rope_idx_var = self.variable(
+                "cache",
+                "cache_rope_index",
+                lambda: jnp.array(0, dtype=jnp.int32),
+            )
 
             start = idx_var.value
+            rope_start = rope_idx_var.value
             # Clamp write position to stay within cache; avoid Python conditionals on traced values.
             start_write = jnp.clip(start, 0, jnp.maximum(0, self.rope_max_len - T))
-            pos = jnp.arange(T, dtype=jnp.int32) + start_write  # [T]
-            q = apply_rope_qk(q, cos_tbl, sin_tbl, pos)                   # [B,T,H,Hd]
-            k = apply_rope_qk(k, cos_tbl, sin_tbl, pos)                   # [B,T,H,Hd]
+            rope_pos = jnp.arange(T, dtype=jnp.int32) + rope_start
+            q = apply_rope_qk_at_positions(q, rope_pos, self.rope_base)  # [B,T,H,Hd]
+            k = apply_rope_qk_at_positions(k, rope_pos, self.rope_base)  # [B,T,H,Hd]
 
             # write to cache at [start:start+T]
             indices = jnp.arange(T) + start_write
@@ -174,6 +202,8 @@ class RoPESelfAttention(nn.Module):
             v_cache.value = v_cache.value.at[:, indices, :, :].set(v)
             # advance index but keep it bounded by rope_max_len to prevent overflow
             idx_var.value = jnp.minimum(start + T, self.rope_max_len)
+            # Keep an absolute RoPE position independent of physical cache shifts.
+            rope_idx_var.value = rope_start + T
 
             # Use full cache but mask out entries beyond current index to avoid dynamic slice sizes.
             K = k_cache.value  # [B,Smax,H,Hd]
@@ -566,7 +596,12 @@ def init_infer_state(
         if isinstance(node, dict):
             out = {}
             for key, value in node.items():
-                if key in ("cached_key", "cached_value", "cache_index"):
+                if key in (
+                    "cached_key",
+                    "cached_value",
+                    "cache_index",
+                    "cache_rope_index",
+                ):
                     out[key] = jnp.zeros_like(value)
                 else:
                     out[key] = _clear_cache_tree(value)

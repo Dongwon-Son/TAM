@@ -243,7 +243,7 @@ def extract_history_window_arrays(
     dof: int = 7,
     q_keys: Sequence[str] = ("q", "qpos"),
     dq_keys: Sequence[str] = ("dq", "qd", "qvel"),
-    tau_keys: Sequence[str] = ("tau_cmd", "tau_commanded", "tau", "u_des", "u", "tau_measured"),
+    tau_keys: Sequence[str] = ("tau_applied", "tau_cmd", "tau_commanded", "tau", "u_des", "u", "tau_measured"),
     gravity_keys: Sequence[str] = ("gravity",),
     t_keys: Sequence[str] = ("t", "t_raw", "timestamp"),
     valid_keys: Sequence[str] = ("valid_for_history",),

@@ -236,6 +236,13 @@ class OnlineTamSimState:
     min_patches_before_send: int
     embedding_interval_s: float
     enable_after_first_embedding: bool
+    # base_tam_fusion checkpoints stream three torque histories (applied, base,
+    # TAM residual) through weight-sharing encoders and a linear fusion layer,
+    # mirroring mapping_server._push_fused_history_window.
+    history_torque_mode: str = "applied"
+    base_runtime: Any = None
+    tam_runtime: Any = None
+    history_fusion_params: Any = None
     patches_since_reset: int = 0
     num_embeddings: int = 0
     num_sent: int = 0
@@ -247,8 +254,16 @@ class OnlineTamSimState:
     def delay_enable(self) -> bool:
         return bool(self.enable_after_first_embedding or self.min_patches_before_send > 0)
 
+    @property
+    def uses_fused_history(self) -> bool:
+        return str(self.history_torque_mode) == "base_tam_fusion"
+
     def reset(self) -> None:
         self.runtime.reset()
+        if self.base_runtime is not None:
+            self.base_runtime.reset()
+        if self.tam_runtime is not None:
+            self.tam_runtime.reset()
         self.patches_since_reset = 0
         self.num_embeddings = 0
         self.num_sent = 0
@@ -1015,16 +1030,71 @@ def _maybe_update_tam(
     q_rows: list[np.ndarray],
     dq_rows: list[np.ndarray],
     tau_rows: list[np.ndarray],
+    tau_base_rows: Optional[list[np.ndarray]] = None,
+    tau_delta_rows: Optional[list[np.ndarray]] = None,
 ) -> None:
     if len(timestamps) < 2:
         return
-    emb = tam.runtime.push_window(
-        timestamps=np.asarray(timestamps, dtype=np.float64),
-        q=np.asarray(q_rows, dtype=np.float32),
-        qd=np.asarray(dq_rows, dtype=np.float32),
-        tau=np.asarray(tau_rows, dtype=np.float32),
-        tau_is_model_space=True,
-    )
+    ts = np.asarray(timestamps, dtype=np.float64)
+    q = np.asarray(q_rows, dtype=np.float32)
+    dq = np.asarray(dq_rows, dtype=np.float32)
+    tau_applied = np.asarray(tau_rows, dtype=np.float32)
+    if tam.uses_fused_history:
+        if tau_base_rows is None or tau_delta_rows is None:
+            raise ValueError(
+                "base_tam_fusion history requires tau_base_rows and tau_delta_rows."
+            )
+        # All three streams share the applied-torque validity mask so that
+        # legitimately-zero base/residual rows are not dropped.
+        applied_emb = tam.runtime.push_window(
+            timestamps=ts,
+            q=q,
+            qd=dq,
+            tau=tau_applied,
+            tau_is_model_space=True,
+            raw_tau=tau_applied,
+        )
+        base_emb = tam.base_runtime.push_window(
+            timestamps=ts,
+            q=q,
+            qd=dq,
+            tau=np.asarray(tau_base_rows, dtype=np.float32),
+            tau_is_model_space=True,
+            raw_tau=tau_applied,
+        )
+        tam_emb = tam.tam_runtime.push_window(
+            timestamps=ts,
+            q=q,
+            qd=dq,
+            tau=np.asarray(tau_delta_rows, dtype=np.float32),
+            tau_is_model_space=True,
+            raw_tau=tau_applied,
+        )
+        emitted = [applied_emb is not None, base_emb is not None, tam_emb is not None]
+        if any(emitted) and not all(emitted):
+            raise RuntimeError(
+                "Fused history streams emitted embeddings out of lockstep "
+                f"(applied/base/tam={emitted}); identical timestamps must yield "
+                "identical patch cadence."
+            )
+        if not all(emitted):
+            return
+        from simadaptor.deploy.mapping_server import _apply_history_fusion
+
+        emb = _apply_history_fusion(
+            tam.history_fusion_params,
+            applied_emb,
+            base_emb,
+            tam_emb,
+        )
+    else:
+        emb = tam.runtime.push_window(
+            timestamps=ts,
+            q=q,
+            qd=dq,
+            tau=tau_applied,
+            tau_is_model_space=True,
+        )
     if emb is None:
         return
     tam.num_embeddings += 1
@@ -1634,6 +1704,7 @@ def _load_fast_tam_bundle(args: argparse.Namespace) -> FastTamBundle:
         xml_path=args.xml,
         load_collision_models=False,
     )
+    args.resolved_history_torque_mode = _require_applied_history_torque_mode(sim_inf)
     _history_apply_fn, adaptor_apply_jit, model_params, norm_stats, cfg = sim_inf.get_apply_fns()
     del _history_apply_fn
     hist_model, adaptor_model = getattr(sim_inf, "_simadaptor_model")
@@ -1651,12 +1722,80 @@ def _load_fast_tam_bundle(args: argparse.Namespace) -> FastTamBundle:
     )
 
 
+def _resolve_history_torque_mode(adaptor_or_inf: Any) -> str:
+    """Resolve a checkpoint's history torque mode, failing on unknown modes."""
+
+    # Mirror mapping_server._simadaptor_config_history_torque_mode without
+    # importing the full deploy server into this simulator. DAgger metadata is
+    # authoritative, then the saved config, then fusion-weight auto-detection.
+    inf = getattr(adaptor_or_inf, "inf", None) or adaptor_or_inf
+    dagger_cfg = getattr(inf, "dagger_cfg", None)
+    cfg = getattr(inf, "cfg", None)
+    configured = getattr(dagger_cfg, "history_torque_mode", None)
+    if not configured:
+        configured = getattr(cfg, "history_torque_mode", None)
+    params = getattr(inf, "_simadaptor_params", {}) or {}
+    try:
+        has_history_fusion = "history_fusion" in params
+    except Exception:
+        has_history_fusion = False
+    resolved = (
+        str(configured).strip()
+        if configured
+        else ("base_tam_fusion" if has_history_fusion else "applied")
+    )
+    if resolved not in {"applied", "base_tam_fusion"}:
+        raise SystemExit(
+            f"Unsupported checkpoint history_torque_mode={resolved!r}; this "
+            "simulator implements 'applied' and 'base_tam_fusion'."
+        )
+    if resolved == "base_tam_fusion" and not has_history_fusion:
+        raise SystemExit(
+            "Checkpoint requests base_tam_fusion history but has no "
+            "params['history_fusion'] weights."
+        )
+    return resolved
+
+
+def _history_fusion_params_from_inf(inf: Any) -> Any:
+    params = getattr(inf, "_simadaptor_params", {}) or {}
+    try:
+        return params["history_fusion"]
+    except Exception as exc:
+        raise RuntimeError(
+            "Checkpoint requested base_tam_fusion history, but history_fusion "
+            "parameters are missing."
+        ) from exc
+
+
+def _require_applied_history_torque_mode(adaptor_or_inf: Any) -> str:
+    """Fail closed when a checkpoint requires history streams this path lacks."""
+
+    resolved = _resolve_history_torque_mode(adaptor_or_inf)
+    if resolved != "applied":
+        raise SystemExit(
+            "The batched source-to-OSC backend supports only the single "
+            "applied-torque history stream, but the checkpoint resolves to "
+            f"history_torque_mode={resolved!r}. Use --sim-backend legacy for "
+            "fused base/TAM history checkpoints."
+        )
+    return str(resolved)
+
+
 def _sim_backend_choice(args: argparse.Namespace, conditions: Sequence[SimConditionSpec]) -> str:
     requested = str(getattr(args, "sim_backend", "auto") or "auto").lower()
     if requested not in {"auto", "legacy", "batched"}:
         raise SystemExit(f"Unknown --sim-backend={requested!r}; expected auto, legacy, or batched.")
+    source_only = bool(getattr(args, "source_only", False))
+    if source_only and requested == "batched":
+        raise SystemExit(
+            "--source-only is not supported by --sim-backend batched; use "
+            "--sim-backend legacy."
+        )
     if requested != "auto":
         return requested
+    if source_only:
+        return "legacy"
     keys = {spec.key for spec in conditions}
     table_keys = {"direct_osc", "tam_carried"}
     if keys and keys.issubset(table_keys):
@@ -1705,6 +1844,9 @@ def _sample_params_for_references(
                 "osc_waypoint_rpy_deg": [list(row) for row in ref.osc_waypoint_rpy_deg],
                 "source_amp_deg": list(ref.source_amp_deg),
                 "source_cycles": list(ref.source_cycles),
+                "resolved_history_torque_mode": str(
+                    getattr(args, "resolved_history_torque_mode", "") or ""
+                ),
                 **setup_meta,
             }
         )
@@ -2381,18 +2523,40 @@ def _build_tam_state(args: argparse.Namespace) -> OnlineTamSimState:
         xml_path=args.xml,
         expected_dt=float(args.dt),
     )
+    resolved_history_mode = _resolve_history_torque_mode(runtime)
+    args.resolved_history_torque_mode = resolved_history_mode
     sim_inf = runtime.inf
     if sim_inf is None:
         raise RuntimeError("RealTimeHistoryAdaptor did not expose SimAdaptorInference.")
     cfg = getattr(sim_inf, "cfg", None)
     ablation_mode = str(getattr(cfg, "ablation_mode", "tam") or "tam")
-    if ablation_mode != "tam":
+    dagger_cfg = getattr(sim_inf, "dagger_cfg", None)
+    # DAgger-finetuned checkpoints are TAM-compatible even when their config
+    # predates the 'tam' mode name.
+    if ablation_mode not in {"tam", "full_mam"} and dagger_cfg is None:
         raise RuntimeError(
             "The public source-to-OSC simulation supports only TAM checkpoints; "
             f"loaded cfg.ablation_mode={ablation_mode!r}."
         )
     _history_apply_fn, adaptor_apply_jit, model_params, norm_stats, _cfg = sim_inf.get_apply_fns()
     del _history_apply_fn, _cfg
+    base_runtime = None
+    tam_runtime = None
+    history_fusion_params = None
+    if resolved_history_mode == "base_tam_fusion":
+        history_fusion_params = _history_fusion_params_from_inf(sim_inf)
+        stream_kwargs = dict(
+            sim_inf=sim_inf,
+            runtime_bundle=runtime.runtime_bundle,
+            expected_dt=float(args.dt),
+        )
+        base_runtime = RealTimeHistoryAdaptor(**stream_kwargs)
+        tam_runtime = RealTimeHistoryAdaptor(**stream_kwargs)
+        print(
+            "[sim] base_tam_fusion history: streaming applied/base/TAM torque "
+            "histories through weight-sharing encoders with a linear fusion layer.",
+            flush=True,
+        )
     state = OnlineTamSimState(
         runtime=runtime,
         adaptor_apply_jit=adaptor_apply_jit,
@@ -2401,6 +2565,10 @@ def _build_tam_state(args: argparse.Namespace) -> OnlineTamSimState:
         min_patches_before_send=int(args.min_patches_before_send),
         embedding_interval_s=float(args.embedding_interval_s),
         enable_after_first_embedding=bool(args.enable_after_first_embedding),
+        history_torque_mode=resolved_history_mode,
+        base_runtime=base_runtime,
+        tam_runtime=tam_runtime,
+        history_fusion_params=history_fusion_params,
     )
     state.reset()
     return state
@@ -2600,13 +2768,20 @@ def _simulate_condition(
     chunk_q: list[np.ndarray] = []
     chunk_dq: list[np.ndarray] = []
     chunk_tau: list[np.ndarray] = []
+    chunk_tau_base: list[np.ndarray] = []
+    chunk_tau_delta: list[np.ndarray] = []
+
+    def clear_chunk() -> None:
+        chunk_t.clear()
+        chunk_q.clear()
+        chunk_dq.clear()
+        chunk_tau.clear()
+        chunk_tau_base.clear()
+        chunk_tau_delta.clear()
 
     def flush_chunk(active_tam: Optional[OnlineTamSimState]) -> None:
         if active_tam is None:
-            chunk_t.clear()
-            chunk_q.clear()
-            chunk_dq.clear()
-            chunk_tau.clear()
+            clear_chunk()
             return
         _maybe_update_tam(
             active_tam,
@@ -2614,11 +2789,10 @@ def _simulate_condition(
             q_rows=chunk_q,
             dq_rows=chunk_dq,
             tau_rows=chunk_tau,
+            tau_base_rows=chunk_tau_base,
+            tau_delta_rows=chunk_tau_delta,
         )
-        chunk_t.clear()
-        chunk_q.clear()
-        chunk_dq.clear()
-        chunk_tau.clear()
+        clear_chunk()
 
     uses_tam = _condition_uses_tam(spec)
 
@@ -2665,6 +2839,10 @@ def _simulate_condition(
         chunk_q.append(q.astype(np.float32))
         chunk_dq.append(dq.astype(np.float32))
         chunk_tau.append(np.asarray(tau_cmd, dtype=np.float32))
+        chunk_tau_base.append(
+            np.asarray(tau_cmd, dtype=np.float32) - np.asarray(tau_delta, dtype=np.float32)
+        )
+        chunk_tau_delta.append(np.asarray(tau_delta, dtype=np.float32))
         if len(chunk_t) >= int(args.window_rows):
             flush_chunk(active_source_tam)
 
@@ -2749,6 +2927,10 @@ def _simulate_condition(
             chunk_q.append(q.astype(np.float32))
             chunk_dq.append(dq.astype(np.float32))
             chunk_tau.append(np.asarray(tau_cmd, dtype=np.float32))
+            chunk_tau_base.append(
+                np.asarray(tau_cmd, dtype=np.float32) - np.asarray(tau_delta, dtype=np.float32)
+            )
+            chunk_tau_delta.append(np.asarray(tau_delta, dtype=np.float32))
             if len(chunk_t) >= int(args.window_rows):
                 flush_chunk(active_target_tam)
 
@@ -3151,6 +3333,9 @@ def run(args: argparse.Namespace) -> Path:
             "osc_waypoint_rpy_deg": [list(row) for row in ref.osc_waypoint_rpy_deg],
             "source_amp_deg": list(ref.source_amp_deg),
             "source_cycles": list(ref.source_cycles),
+            "resolved_history_torque_mode": str(
+                getattr(args, "resolved_history_torque_mode", "") or ""
+            ),
             **setup_meta,
         }
         setup_rows.append(setup_row)

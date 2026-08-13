@@ -22,9 +22,14 @@ from simadaptor.deploy.jax_cache import (
     DEFAULT_DEPLOY_JAX_CACHE_XLA_CACHES as DEFAULT_HISTORY_JAX_CACHE_XLA_CACHES,
     configure_jax_persistent_cache,
 )
+from simadaptor.eval.online_runtime import (
+    attention_history_tokens_from_seconds,
+    limit_decode_cache_attention_window,
+)
 
 
 DEFAULT_SIMADAPTOR_CKPT_PATH = "checkpoints/tam/example"
+DEFAULT_DEPLOY_ATTENTION_HISTORY_S = 4.0
 
 
 def _numeric_leaf_to_jax(value: Any) -> tuple[Any, bool]:
@@ -124,6 +129,7 @@ class RealTimeHistoryAdaptor:
         checkpoint_step: int | None = None,
         xml_path: str | Path | None = None,
         expected_dt: float = 0.001,
+        attention_history_s: float | None = DEFAULT_DEPLOY_ATTENTION_HISTORY_S,
         jax_cache_dir: str | Path | None = None,
         jax_cache_min_compile_time_s: float = 0.0,
         jax_cache_min_entry_size_bytes: int = -1,
@@ -169,6 +175,8 @@ class RealTimeHistoryAdaptor:
             getattr(hist_cfg, "masked_fit_max_neighbors_each_side", 50) or 50
         )
         self._expected_dt = expected_dt
+        if float(self._expected_dt) <= 0.0:
+            raise ValueError(f"expected_dt must be positive, got {expected_dt}")
 
         self._history_smoothing = "masked_local_fit"
         self._context_half = self._masked_fit_half
@@ -176,6 +184,30 @@ class RealTimeHistoryAdaptor:
             int(self._patch_size + 2 * self._context_half)
             if self._context_half > 0
             else int(self._patch_size)
+        )
+        # The public release ships the jointwise_flat AR encoder with RoPE
+        # locked on, so these runtime facts are fixed rather than read from
+        # pruned config fields.
+        self._jointwise_history = True
+        self._cache_tokens_per_history_step = self._dof
+        self._use_rope = True
+        self._rope_base = float(getattr(hist_cfg, "rope_base", 10000.0))
+        if attention_history_s is not None and float(attention_history_s) < 0.0:
+            raise ValueError(
+                "attention_history_s must be non-negative when set; "
+                f"got {attention_history_s}."
+            )
+        self._attention_history_s = attention_history_s
+        self._attention_history_tokens = attention_history_tokens_from_seconds(
+            attention_history_s,
+            self._expected_dt,
+            decode_patch_size=self._decode_patch_size,
+            patch_stride=self._patch_stride,
+        )
+        self._attention_history_cache_tokens = (
+            None
+            if self._attention_history_tokens is None
+            else int(self._attention_history_tokens) * self._cache_tokens_per_history_step
         )
         self._hist_params_jit, self._hist_params_dynamic_arg = _tree_to_jax_dynamic_arg(
             self._runtime_bundle.hist_params
@@ -205,6 +237,14 @@ class RealTimeHistoryAdaptor:
                 f"[RealTimeHistoryAdaptor] Masked local-fit smoothing context enabled: "
                 f"decode_patch_size={self._decode_patch_size} "
                 f"(patch_size={self._patch_size}, context_half={self._context_half})."
+            )
+        if self._attention_history_tokens is not None:
+            print(
+                "[RealTimeHistoryAdaptor] Transformer attention history limited: "
+                f"attention_history_s={float(attention_history_s):g}, "
+                f"temporal_history_patches={self._attention_history_tokens}, "
+                f"cache_tokens={self._attention_history_cache_tokens}, "
+                f"tokens_per_history_step={self._cache_tokens_per_history_step}."
             )
         print("Warming up JIT for RealTimeHistoryAdaptor...")
         warmup_start_time = time.time()
@@ -267,6 +307,10 @@ class RealTimeHistoryAdaptor:
         use_dynamic_params = bool(self._hist_params_dynamic_arg)
         use_dynamic_norm_stats = bool(self._norm_stats_dynamic_arg)
         valid_mask = jnp.ones((1, 1), dtype=jnp.float32)
+        attention_history_cache_tokens = self._attention_history_cache_tokens
+        cache_tokens_per_history_step = self._cache_tokens_per_history_step
+        use_rope = self._use_rope
+        rope_base = self._rope_base
 
         @functools.partial(jax.jit, static_argnames=())
         def _step(
@@ -278,6 +322,13 @@ class RealTimeHistoryAdaptor:
             u_patch,
             input_keep_mask,
         ):
+            cache = limit_decode_cache_attention_window(
+                cache,
+                attention_history_cache_tokens,
+                append_tokens=cache_tokens_per_history_step,
+                rebase_rope=use_rope,
+                rope_base=rope_base,
+            )
             emb, cache_out = self._models_transformer.step_decode(
                 params=params_arg if use_dynamic_params else closed_params,
                 cache=cache,
@@ -329,6 +380,7 @@ class RealTimeHistoryAdaptor:
         gravity=None,
         *,
         tau_is_model_space: bool = False,
+        raw_tau=None,
         keep_mask=None,
     ) -> jnp.ndarray | None:
         """
@@ -347,6 +399,7 @@ class RealTimeHistoryAdaptor:
             tau=np.asarray([tau], dtype=np.float32),
             gravity=None if gravity is None else np.asarray([gravity], dtype=np.float32),
             tau_is_model_space=tau_is_model_space,
+            raw_tau=None if raw_tau is None else np.asarray([raw_tau], dtype=np.float32),
             keep_mask=keep,
         )
 
@@ -359,6 +412,7 @@ class RealTimeHistoryAdaptor:
         gravity=None,
         *,
         tau_is_model_space: bool = False,
+        raw_tau=None,
         keep_mask=None,
     ) -> jnp.ndarray | None:
         """
@@ -369,6 +423,9 @@ class RealTimeHistoryAdaptor:
         build the model-space torque history expected by the history encoder.
         If `tau_is_model_space=True`, `tau` is assumed to already be in model
         space and `gravity` is ignored.
+        If `raw_tau` is provided, it is used only as the zero-torque masking
+        reference; this is useful for fused histories where a base or residual
+        torque stream should share the applied-torque validity mask.
         Raw zero-torque rows and explicit keep-mask invalid rows are zeroed
         before buffering, matching the deploy adaptor's history semantics.
         - Handles variable receive window sizes/frequencies.
@@ -401,6 +458,7 @@ class RealTimeHistoryAdaptor:
             context="RealTimeHistoryAdaptor.push_window",
             tau_is_model_space=tau_is_model_space,
             apply_zero_torque_mask=True,
+            raw_tau=raw_tau,
         )
         if keep_mask is not None:
             keep_external = np.asarray(keep_mask, dtype=np.float32).reshape(-1)
@@ -624,6 +682,7 @@ def validate_online_vs_static(
     simadaptor_ckpt_path: str | None = None,
     xml_path: str | Path | None = None,
     expected_dt: float = 0.001,
+    attention_history_s: float | None = DEFAULT_DEPLOY_ATTENTION_HISTORY_S,
     stream_window: int | None = None,
     seed: int = 0,
     trim_to_stride: bool = True,
@@ -634,6 +693,7 @@ def validate_online_vs_static(
         simadaptor_ckpt_path=simadaptor_ckpt_path,
         xml_path=xml_path,
         expected_dt=expected_dt,
+        attention_history_s=attention_history_s,
     )
     sim_inf = adaptor.inf
     if sim_inf is None:
@@ -805,6 +865,15 @@ def main() -> None:
     parser.add_argument("--traj-npz", type=Path, default=None)
     parser.add_argument("--ckpt-path", type=str, default=None)
     parser.add_argument("--expected-dt", type=float, default=0.001)
+    parser.add_argument(
+        "--attention-history-s",
+        type=float,
+        default=DEFAULT_DEPLOY_ATTENTION_HISTORY_S,
+        help=(
+            "Limit transformer decode-cache attention to this many seconds "
+            f"(default: {DEFAULT_DEPLOY_ATTENTION_HISTORY_S:g}); <=0 keeps the full cache."
+        ),
+    )
     parser.add_argument("--stream-window", type=int, default=None)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--trim-to-stride", action=argparse.BooleanOptionalAction, default=True)
@@ -819,6 +888,7 @@ def main() -> None:
             traj_npz=args.traj_npz,
             simadaptor_ckpt_path=args.ckpt_path,
             expected_dt=float(args.expected_dt),
+            attention_history_s=args.attention_history_s,
             stream_window=args.stream_window,
             seed=int(args.seed),
             trim_to_stride=bool(args.trim_to_stride),

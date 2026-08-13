@@ -9,9 +9,10 @@ Responsibilities:
   (PUSH -> PULL on the controller side).
 
 Message shapes match ``examples/history_controller.py``:
-  History publish: {"type": "history", "window": [{t, q, qd, tau_cmd, tau_measured,
-                                                  tau_adaptor_delta, valid_for_history,
-                                                  synthetic_padding, sample_dt_sec}, ...]}
+  History publish: {"type": "history", "window": [{t, q, qd, tau_applied, tau_base,
+                                                  tau_adaptor_delta, tau_measured,
+                                                  valid_for_history, synthetic_padding,
+                                                  publish_ready, sample_dt_sec}, ...]}
   Reset publish (from controller): {"type": "reset", "reason": "..."}
   Command publish (from client): {"target_q": [...], "target_dq": [...],
                                   "stiffness": [...], "damping": [...],
@@ -73,14 +74,19 @@ class _HistoryLogger:
             "q",
             "dq",
             "tau_cmd",
+            "tau_applied",
+            "tau_base",
             "tau_commanded",
             "tau_measured",
             "gravity",
             "coriolis",
             "tau_adaptor_delta",
+            "tau_tam_residual",
+            "history_embedding_seq",
             "adaptor_active",
             "valid_for_history",
             "synthetic_padding",
+            "publish_ready",
             "sample_dt_sec",
         ]
         self.fields = fields if fields is not None else default_fields

@@ -2,7 +2,9 @@
 
 This repo includes the workstation-side TAM mapping server and the external
 trajectory-evaluation wrapper. The low-level robot controller bridge runs on the
-deployment controller machine and is not included here.
+deployment controller machine and is not included here; a ready-made controller
+side for robot-control-stack (Franka Panda/FR3) is available — see
+[rcs_integration.md](rcs_integration.md).
 
 ## Connection Roles
 

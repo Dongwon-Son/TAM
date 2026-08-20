@@ -28,6 +28,7 @@ from simadaptor.deploy.mapping_server_meta import (
     MAPPING_MODE_SIMADAPTOR,
 )
 from simadaptor.deploy.runtime_common import (
+    apply_history_fusion,
     extract_history_window_arrays,
     flatten_history_embedding_for_transport,
 )
@@ -162,17 +163,7 @@ def _apply_history_fusion(
     history_emb_base: Any,
     history_emb_tam: Any,
 ) -> Any:
-    import jax.numpy as jnp
-
-    x = jnp.concatenate(
-        [
-            jnp.asarray(history_emb_applied, dtype=jnp.float32),
-            jnp.asarray(history_emb_base, dtype=jnp.float32),
-            jnp.asarray(history_emb_tam, dtype=jnp.float32),
-        ],
-        axis=-1,
-    )
-    return jnp.einsum("...i,ij->...j", x, fusion_params["kernel"]) + fusion_params["bias"]
+    return apply_history_fusion(fusion_params, history_emb_applied, history_emb_base, history_emb_tam)
 
 
 def _format_age_s(age_s: Optional[float]) -> str:

@@ -312,28 +312,3 @@ def extract_history_window_arrays(
 # Backward-compatible aliases used by existing tests/callers.
 _mask_zero_torque_history_inputs = mask_zero_torque_history_inputs
 _zero_torque_history_keep_mask = zero_torque_history_keep_mask
-
-
-def apply_history_fusion(
-    fusion_params: Any,
-    history_emb_applied: Any,
-    history_emb_base: Any,
-    history_emb_tam: Any,
-) -> Any:
-    """Linear fusion of the applied/base/TAM history embeddings (``base_tam_fusion`` checkpoints).
-
-    Shared by the workstation mapping server and the offline/sim evaluators so the
-    simulator does not need the mapping server's transport dependencies.
-    """
-    import jax.numpy as jnp
-
-    x = jnp.concatenate(
-        [
-            jnp.asarray(history_emb_applied, dtype=jnp.float32),
-            jnp.asarray(history_emb_base, dtype=jnp.float32),
-            jnp.asarray(history_emb_tam, dtype=jnp.float32),
-        ],
-        axis=-1,
-    )
-    return jnp.einsum("...i,ij->...j", x, fusion_params["kernel"]) + fusion_params["bias"]
-

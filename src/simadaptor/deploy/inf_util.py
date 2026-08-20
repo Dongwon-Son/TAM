@@ -259,37 +259,7 @@ class SimAdaptorInference:
             except Exception as exc:
                 last_error = exc
 
-        # Orbax checkpoints saved on an accelerator carry device shardings; restoring
-        # them on a host without that device type (e.g. CPU-only JAX) fails inside
-        # flax's target=None path. Fall back to a sharding-free numpy restore.
-        try:
-            return SimAdaptorInference._restore_orbax_pytree_as_numpy(ckpt_path)
-        except Exception as exc:  # pragma: no cover - depends on orbax version
-            last_error = RuntimeError(f"{last_error}; numpy fallback failed: {exc}")
-
         raise RuntimeError(f"Failed to restore Flax checkpoint from {ckpt_path}: {last_error}") from last_error
-
-    @staticmethod
-    def _restore_orbax_pytree_as_numpy(ckpt_path: Path):
-        """Restore an Orbax PyTree checkpoint with every leaf as ``np.ndarray`` (device agnostic)."""
-        import jax
-        import numpy as np
-        import orbax.checkpoint as ocp
-
-        checkpointer = ocp.PyTreeCheckpointer()
-        metadata = checkpointer.metadata(str(ckpt_path))
-        item = getattr(metadata, "item_metadata", metadata)
-        tree = getattr(item, "tree", item)
-        leaves, treedef = jax.tree_util.tree_flatten(tree)
-        restore_args = jax.tree_util.tree_unflatten(
-            treedef, [ocp.RestoreArgs(restore_type=np.ndarray) for _ in leaves]
-        )
-        try:
-            return checkpointer.restore(
-                str(ckpt_path), args=ocp.args.PyTreeRestore(restore_args=restore_args)
-            )
-        except TypeError:
-            return checkpointer.restore(str(ckpt_path), restore_args=restore_args)
 
     @staticmethod
     def _resolve_ckpt_xml_path(ckpt_dir: Path, cfg) -> Path | None:

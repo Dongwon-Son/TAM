@@ -19,14 +19,6 @@ os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 import mujoco
 import numpy as np
 
-from simadaptor.deploy.rcs_controller_replica import (
-    LIBFRANKA_DEFAULT_CUTOFF_HZ,
-    RCS_DEFAULT_TORQUE_LIMIT_NM,
-    RcsControllerReplica,
-    RcsMujocoStepper,
-    libfranka_command_tail,
-    make_replica_config_from_args,
-)
 from simadaptor.deploy.source_to_osc_common import (
     DEFAULT_OSC_NULLSPACE_STIFFNESS,
     DEFAULT_OSC_WAYPOINT_RPY_DEG_MAX,
@@ -1087,9 +1079,9 @@ def _maybe_update_tam(
             )
         if not all(emitted):
             return
-        from simadaptor.deploy.runtime_common import apply_history_fusion
+        from simadaptor.deploy.mapping_server import _apply_history_fusion
 
-        emb = apply_history_fusion(
+        emb = _apply_history_fusion(
             tam.history_fusion_params,
             applied_emb,
             base_emb,
@@ -1800,15 +1792,9 @@ def _sim_backend_choice(args: argparse.Namespace, conditions: Sequence[SimCondit
             "--source-only is not supported by --sim-backend batched; use "
             "--sim-backend legacy."
         )
-    controller_law = str(getattr(args, "controller_law", "history") or "history")
-    if controller_law == "rcs" and requested == "batched":
-        raise SystemExit(
-            "--controller-law rcs is only implemented by the legacy backend; use "
-            "--sim-backend legacy."
-        )
     if requested != "auto":
         return requested
-    if source_only or controller_law == "rcs":
+    if source_only:
         return "legacy"
     keys = {spec.key for spec in conditions}
     table_keys = {"direct_osc", "tam_carried"}
@@ -2732,53 +2718,6 @@ def _make_models(
     return plant_model, plant_data, controller_model, controller_data
 
 
-class _LibfrankaTailState:
-    """libfranka ``Robot::control`` default command tail (low-pass + rate limit) for the history law."""
-
-    def __init__(self, dof: int, *, cutoff_hz: Optional[float], limit_rate: bool, control_dt: float) -> None:
-        self.dof = int(dof)
-        self.cutoff_hz = cutoff_hz
-        self.limit_rate = bool(limit_rate)
-        self.control_dt = float(control_dt)
-        self.tau_J_d = np.zeros(self.dof, dtype=np.float64)
-
-    def reset(self) -> None:
-        self.tau_J_d = np.zeros(self.dof, dtype=np.float64)
-
-    def apply(self, tau_cmd_model_space: np.ndarray, gravity: np.ndarray) -> np.ndarray:
-        g = np.asarray(gravity, dtype=np.float64).reshape(self.dof)
-        tau_nograv = np.asarray(tau_cmd_model_space, dtype=np.float64).reshape(self.dof) - g
-        tau_nograv = libfranka_command_tail(
-            tau_nograv,
-            self.tau_J_d,
-            cutoff_hz=self.cutoff_hz,
-            limit_rate=self.limit_rate,
-        )
-        self.tau_J_d = tau_nograv.copy()
-        return tau_nograv + g
-
-
-def _resolve_libfranka_filter_args(args: argparse.Namespace) -> str:
-    """Resolve ``--libfranka-command-filter auto`` and materialize cutoff/rate-limit args."""
-    controller_law = str(getattr(args, "controller_law", "history") or "history")
-    if controller_law not in ("history", "rcs"):
-        raise SystemExit(f"Unknown --controller-law={controller_law!r}; expected history or rcs.")
-    mode = str(getattr(args, "libfranka_command_filter", "auto") or "auto").lower()
-    if mode not in ("auto", "default", "none"):
-        raise SystemExit(f"Unknown --libfranka-command-filter={mode!r}; expected auto, default, or none.")
-    if mode == "auto":
-        mode = "default" if controller_law == "rcs" else "none"
-    if mode == "default":
-        cutoff = getattr(args, "libfranka_cutoff_hz", None)
-        args.libfranka_cutoff_hz = float(LIBFRANKA_DEFAULT_CUTOFF_HZ) if cutoff is None else float(cutoff)
-        args.libfranka_limit_rate = True
-    else:
-        args.libfranka_cutoff_hz = None
-        args.libfranka_limit_rate = False
-    args.libfranka_command_filter_resolved = mode
-    return mode
-
-
 def _simulate_condition(
     *,
     args: argparse.Namespace,
@@ -2820,37 +2759,6 @@ def _simulate_condition(
     controller_guard_velocity_threshold = float(
         getattr(args, "controller_guard_velocity_threshold", 4.0)
     )
-    controller_law = str(getattr(args, "controller_law", "history") or "history")
-    if controller_law not in ("history", "rcs"):
-        raise ValueError(f"Unknown controller_law={controller_law!r}")
-    if not hasattr(args, "libfranka_command_filter_resolved"):
-        _resolve_libfranka_filter_args(args)
-    libfranka_filter_mode = str(getattr(args, "libfranka_command_filter_resolved", "none"))
-    rcs_stepper: Optional[RcsMujocoStepper] = None
-    history_tail: Optional[_LibfrankaTailState] = None
-    if controller_law == "rcs":
-        ctrl_site_id = int(
-            mujoco.mj_name2id(controller_model, mujoco.mjtObj.mjOBJ_SITE, str(args.fk_site))
-        )
-        if ctrl_site_id < 0:
-            raise ValueError(f"Site not found in controller XML: {args.fk_site}")
-        rcs_stepper = RcsMujocoStepper(
-            replica=RcsControllerReplica(make_replica_config_from_args(args, dof)),
-            controller_model=controller_model,
-            controller_data=controller_data,
-            qpos_idx=ctrl_qpos_idx,
-            qvel_idx=ctrl_qvel_idx,
-            site_id=ctrl_site_id,
-        )
-        rcs_stepper.begin_phase("joint", float(source_t[0]))
-    elif libfranka_filter_mode == "default":
-        history_tail = _LibfrankaTailState(
-            dof,
-            cutoff_hz=getattr(args, "libfranka_cutoff_hz", None),
-            limit_rate=bool(getattr(args, "libfranka_limit_rate", True)),
-            control_dt=float(args.dt),
-        )
-    tail_active = rcs_stepper is not None or history_tail is not None
 
     window_len = max(int(args.adaptor_seq_length), 1)
     q_short = np.repeat(initial_q.astype(np.float32)[None, :], window_len, axis=0)
@@ -2900,31 +2808,21 @@ def _simulate_condition(
         q = np.asarray(plant_data.qpos[qpos_idx], dtype=np.float64)
         dq = np.asarray(plant_data.qvel[qvel_idx], dtype=np.float64)
         mujoco.mj_forward(plant_model, plant_data)
-        gravity_now: Optional[np.ndarray] = None
-        if rcs_stepper is not None:
-            tau_plain, _rcs_info, rcs_quant = rcs_stepper.step_joint(
-                t_now=float(t_now),
-                q=q,
-                dq=dq,
-                q_ref=source_q[step_idx],
-            )
-            gravity_now = rcs_quant["gravity"]
-        else:
-            tau_plain = _joint_impedance_torque(
-                controller_model=controller_model,
-                controller_data=controller_data,
-                qpos_idx=ctrl_qpos_idx,
-                qvel_idx=ctrl_qvel_idx,
-                q=q,
-                dq=dq,
-                q_ref=source_q[step_idx],
-                dq_ref=source_dq[step_idx],
-                kp=joint_kp,
-                kd=joint_kd,
-                joint_range=controller_joint_range,
-                controller_guard_enabled=controller_guard_enabled,
-                velocity_threshold=controller_guard_velocity_threshold,
-            )
+        tau_plain = _joint_impedance_torque(
+            controller_model=controller_model,
+            controller_data=controller_data,
+            qpos_idx=ctrl_qpos_idx,
+            qvel_idx=ctrl_qvel_idx,
+            q=q,
+            dq=dq,
+            q_ref=source_q[step_idx],
+            dq_ref=source_dq[step_idx],
+            kp=joint_kp,
+            kd=joint_kd,
+            joint_range=controller_joint_range,
+            controller_guard_enabled=controller_guard_enabled,
+            velocity_threshold=controller_guard_velocity_threshold,
+        )
         q_short = _push_short(q_short, q.astype(np.float32))
         dq_short = _push_short(dq_short, dq.astype(np.float32))
         tau_plain_window = _push_short(tau_short, tau_plain.astype(np.float32))
@@ -2934,19 +2832,6 @@ def _simulate_condition(
             dq_window=dq_short,
             tau_plain_window=tau_plain_window,
         )
-        if tail_active:
-            if gravity_now is None:
-                gravity_now = _gravity_torque(
-                    controller_model,
-                    controller_data,
-                    ctrl_qpos_idx,
-                    ctrl_qvel_idx,
-                    q,
-                )
-            if rcs_stepper is not None:
-                tau_cmd = rcs_stepper.finalize(tau_cmd, gravity_now)
-            elif history_tail is not None:
-                tau_cmd = history_tail.apply(tau_cmd, gravity_now)
         tau_short = tau_plain_window.copy()
         tau_short[-1] = np.asarray(tau_cmd, dtype=np.float32)
 
@@ -2955,9 +2840,7 @@ def _simulate_condition(
         chunk_dq.append(dq.astype(np.float32))
         chunk_tau.append(np.asarray(tau_cmd, dtype=np.float32))
         chunk_tau_base.append(
-            np.asarray(tau_plain, dtype=np.float32)
-            if tail_active
-            else np.asarray(tau_cmd, dtype=np.float32) - np.asarray(tau_delta, dtype=np.float32)
+            np.asarray(tau_cmd, dtype=np.float32) - np.asarray(tau_delta, dtype=np.float32)
         )
         chunk_tau_delta.append(np.asarray(tau_delta, dtype=np.float32))
         if len(chunk_t) >= int(args.window_rows):
@@ -3005,47 +2888,29 @@ def _simulate_condition(
         active_target_tam = tam_state if spec.tam_on_target else None
         target_t_offset = float(source_t[-1])
         q_nullspace = np.asarray(source_q[-1], dtype=np.float64).reshape(dof)
-        if rcs_stepper is not None:
-            # RCS switches controllers by stopping the joint thread and starting the OSC thread.
-            rcs_stepper.begin_phase("osc", target_t_offset + float(target_t[0]))
-        if history_tail is not None:
-            history_tail.reset()
         for step_idx, t_rel in enumerate(target_t):
             t_now = target_t_offset + float(t_rel)
             q = np.asarray(plant_data.qpos[qpos_idx], dtype=np.float64)
             dq = np.asarray(plant_data.qvel[qvel_idx], dtype=np.float64)
             mujoco.mj_forward(plant_model, plant_data)
-            gravity_now = None
-            if rcs_stepper is not None:
-                tau_plain, _rcs_info, rcs_quant = rcs_stepper.step_osc(
-                    t_now=float(t_now),
-                    q=q,
-                    dq=dq,
-                    target_pos=target_pos[step_idx],
-                    target_quat_wxyz=target_quat[step_idx],
-                )
-                gravity_now = rcs_quant["gravity"]
-                ee_pos = np.asarray(rcs_quant["ee_pos"], dtype=np.float64)
-                ee_quat = np.asarray(rcs_quant["ee_quat"], dtype=np.float64)
-            else:
-                tau_plain, ee_pos, ee_quat = _osc_torque(
-                    plant_model=plant_model,
-                    plant_data=plant_data,
-                    qpos_idx=qpos_idx,
-                    qvel_idx=qvel_idx,
-                    site_id=site_id,
-                    target_pos=target_pos[step_idx],
-                    target_quat=target_quat[step_idx],
-                    stiffness=osc_stiffness,
-                    damping=osc_damping,
-                    q_nullspace=q_nullspace,
-                    nullspace_stiffness=osc_nullspace_stiffness,
-                    joint_kp=joint_kp,
-                    joint_kd=joint_kd,
-                    joint_range=controller_joint_range,
-                    controller_guard_enabled=controller_guard_enabled,
-                    velocity_threshold=controller_guard_velocity_threshold,
-                )
+            tau_plain, ee_pos, ee_quat = _osc_torque(
+                plant_model=plant_model,
+                plant_data=plant_data,
+                qpos_idx=qpos_idx,
+                qvel_idx=qvel_idx,
+                site_id=site_id,
+                target_pos=target_pos[step_idx],
+                target_quat=target_quat[step_idx],
+                stiffness=osc_stiffness,
+                damping=osc_damping,
+                q_nullspace=q_nullspace,
+                nullspace_stiffness=osc_nullspace_stiffness,
+                joint_kp=joint_kp,
+                joint_kd=joint_kd,
+                joint_range=controller_joint_range,
+                controller_guard_enabled=controller_guard_enabled,
+                velocity_threshold=controller_guard_velocity_threshold,
+            )
             q_short = _push_short(q_short, q.astype(np.float32))
             dq_short = _push_short(dq_short, dq.astype(np.float32))
             tau_plain_window = _push_short(tau_short, tau_plain.astype(np.float32))
@@ -3055,19 +2920,6 @@ def _simulate_condition(
                 dq_window=dq_short,
                 tau_plain_window=tau_plain_window,
             )
-            if tail_active:
-                if gravity_now is None:
-                    gravity_now = _gravity_torque(
-                        controller_model,
-                        controller_data,
-                        ctrl_qpos_idx,
-                        ctrl_qvel_idx,
-                        q,
-                    )
-                if rcs_stepper is not None:
-                    tau_cmd = rcs_stepper.finalize(tau_cmd, gravity_now)
-                elif history_tail is not None:
-                    tau_cmd = history_tail.apply(tau_cmd, gravity_now)
             tau_short = tau_plain_window.copy()
             tau_short[-1] = np.asarray(tau_cmd, dtype=np.float32)
 
@@ -3076,9 +2928,7 @@ def _simulate_condition(
             chunk_dq.append(dq.astype(np.float32))
             chunk_tau.append(np.asarray(tau_cmd, dtype=np.float32))
             chunk_tau_base.append(
-                np.asarray(tau_plain, dtype=np.float32)
-                if tail_active
-                else np.asarray(tau_cmd, dtype=np.float32) - np.asarray(tau_delta, dtype=np.float32)
+                np.asarray(tau_cmd, dtype=np.float32) - np.asarray(tau_delta, dtype=np.float32)
             )
             chunk_tau_delta.append(np.asarray(tau_delta, dtype=np.float32))
             if len(chunk_t) >= int(args.window_rows):
@@ -3173,10 +3023,6 @@ def _simulate_condition(
         "tam_embeddings_sent": int(report_tam_state.num_sent) if report_tam_state is not None else 0,
         "controller_side_guard": bool(controller_guard_enabled),
         "controller_guard_velocity_threshold": float(controller_guard_velocity_threshold),
-        "controller_law": controller_law,
-        "libfranka_command_filter": libfranka_filter_mode,
-        "rcs_goals_sent": int(rcs_stepper.replica.num_goals_sent) if rcs_stepper is not None else 0,
-        "rcs_goals_skipped": int(rcs_stepper.replica.num_goals_skipped) if rcs_stepper is not None else 0,
         **metrics,
     }
     (condition_dir / "metrics.json").write_text(
@@ -3307,62 +3153,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=4.0,
         help="Velocity threshold in rad/s for the controller-side safety damping guard.",
     )
-    parser.add_argument(
-        "--controller-law",
-        choices=("history", "rcs"),
-        default="history",
-        help=(
-            "Nominal-torque generator: 'history' is the TAM reference law (joint impedance / "
-            "Cartesian impedance + nullspace + coriolis); 'rcs' replays robot-control-stack's "
-            "hw::Franka joint_controller()/osc() including its 20 Hz setpoint interpolators, "
-            "error deadbands, static-posture nullspace, joint-limit avoidance, rate limit and "
-            "torque_limit clamp (legacy backend only)."
-        ),
-    )
-    parser.add_argument(
-        "--libfranka-command-filter",
-        choices=("auto", "default", "none"),
-        default="auto",
-        help=(
-            "Emulate franka::Robot::control's default command tail (100 Hz first-order low-pass "
-            "on the commanded torque followed by 1000 Nm/s rate limiting) after the TAM hook. "
-            "'auto' = default for --controller-law rcs, none for history."
-        ),
-    )
-    parser.add_argument(
-        "--libfranka-cutoff-hz",
-        type=float,
-        default=None,
-        help="Override the libfranka low-pass cutoff (Hz) when the command filter is active; <=0 disables the low-pass only.",
-    )
-    parser.add_argument("--rcs-joint-kp", type=parse_float_vec, default=None, help="RCS FrankaConfig.kp (7 values).")
-    parser.add_argument("--rcs-joint-kd", type=parse_float_vec, default=None, help="RCS FrankaConfig.kd (7 values).")
-    parser.add_argument("--rcs-kp-p", type=parse_vec3, default=None, help="RCS FrankaConfig.kp_p (3 values).")
-    parser.add_argument("--rcs-kp-r", type=float, default=None, help="RCS FrankaConfig.kp_r.")
-    parser.add_argument(
-        "--rcs-torque-limit",
-        type=parse_float_vec,
-        default=None,
-        help=(
-            "RCS FrankaConfig.torque_limit clamp on the gravity-free command (1 or 7 values). "
-            f"RCS default is {RCS_DEFAULT_TORQUE_LIMIT_NM:g} Nm per joint."
-        ),
-    )
-    parser.add_argument("--rcs-policy-rate-hz", type=int, default=20, help="RCS interpolator policy_rate (hard-coded 20 in RCS).")
-    parser.add_argument("--rcs-traj-rate-hz", type=int, default=500, help="RCS interpolator traj_rate (hard-coded 500 in RCS).")
-    parser.add_argument("--rcs-traj-time-fraction", type=float, default=1.0)
-    parser.add_argument(
-        "--rcs-action-dedup-atol",
-        type=float,
-        default=1e-3,
-        help="RobotWrapper.action() duplicate-action skip tolerance; negative disables the skip.",
-    )
-    parser.add_argument("--rcs-static-q-task", type=parse_float_vec, default=None, help="RCS OSC static nullspace posture (7 values).")
-    parser.add_argument("--rcs-residual-mass-vec", type=parse_float_vec, default=None)
-    parser.add_argument("--rcs-pos-deadband", type=float, default=None)
-    parser.add_argument("--rcs-ori-deadband", type=float, default=None)
-    parser.add_argument("--rcs-pinv-eps", type=float, default=None)
-    parser.add_argument("--rcs-limit-rate", action=argparse.BooleanOptionalAction, default=True)
 
     parser.add_argument("--target-duration-s", type=float, default=8.0)
     parser.add_argument("--osc-delta-xyz", type=parse_vec3, default=DEFAULT_SIM_OSC_WAYPOINT_XYZ[-1])
@@ -3417,7 +3207,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def run(args: argparse.Namespace) -> Path:
     conditions = resolve_sim_conditions(args.conditions)
     dof = _resolve_robot_args(args)
-    _resolve_libfranka_filter_args(args)
     sim_backend = _sim_backend_choice(args, conditions)
     setattr(args, "sim_backend_resolved", sim_backend)
     run_dir = args.outdir.expanduser().resolve() / dt.datetime.now().strftime("%Y%m%d_%H%M%S")

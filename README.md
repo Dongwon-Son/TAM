@@ -220,17 +220,6 @@ Outputs are written under `eval_logs/source_to_osc_tam_sim/<timestamp>/`:
 
 Use `--conditions tam_all` to include both reset and carried TAM rows.
 
-## Robot-Control-Stack Integration
-
-TAM runs underneath [robot-control-stack](https://github.com/RobotControlStack/robot-control-stack)
-via the [`Dongwon-Son/robot-control-stack`](https://github.com/Dongwon-Son/robot-control-stack)
-fork (branch `tam`): a C++ `TamHook` inside `hw::Franka`'s torque controllers
-plus the `rcs_tam` bridge extension serving this repository's deployment
-protocol. The sim evaluator can also replay RCS's torque law
-(`--controller-law rcs`), and `scripts/deploy/rcs_tam_hook_parity.py` /
-`scripts/deploy/rcs_tam_bridge_sim_smoke.py` verify the integration without a
-robot. See [docs/rcs_integration.md](docs/rcs_integration.md).
-
 ## Public Scripts
 
 | TAM command | Script |

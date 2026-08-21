@@ -282,6 +282,7 @@ class RealTimeHistoryAdaptor:
         simadaptor_ckpt_path: str | Path | None = None,
         *,
         xml_path: str | Path | None = None,
+        require_history_torque_mode: str | None = "applied",
         **kwargs,
     ) -> "RealTimeHistoryAdaptor":
         """Deployment convenience constructor with packaged defaults.
@@ -290,6 +291,13 @@ class RealTimeHistoryAdaptor:
         (cached under ``~/.cache/simadaptor``); ``xml_path=None`` uses the
         packaged ideal-model MJCF. Remaining keyword arguments are forwarded
         to the regular constructor.
+
+        This entry point builds a **single-stream** runtime, which is only
+        correct for ``require_history_torque_mode`` checkpoints (default
+        ``"applied"``): a ``base_tam_fusion`` checkpoint needs one runtime per
+        history stream plus its ``history_fusion`` weights, wired via the
+        regular constructor (``sim_inf=``/``runtime_bundle=`` sharing). Pass
+        ``require_history_torque_mode=None`` to skip the check.
         """
         from simadaptor.assets import default_panda_xml, fetch_checkpoint
 
@@ -297,7 +305,18 @@ class RealTimeHistoryAdaptor:
             simadaptor_ckpt_path = fetch_checkpoint()
         if xml_path is None:
             xml_path = default_panda_xml()
-        return cls(simadaptor_ckpt_path=str(simadaptor_ckpt_path), xml_path=str(xml_path), **kwargs)
+        runtime = cls(simadaptor_ckpt_path=str(simadaptor_ckpt_path), xml_path=str(xml_path), **kwargs)
+        if (
+            require_history_torque_mode is not None
+            and runtime.history_torque_mode != require_history_torque_mode
+        ):
+            raise RuntimeError(
+                f"from_checkpoint builds a single-stream runtime, which supports "
+                f"{require_history_torque_mode!r} checkpoints; got "
+                f"{runtime.history_torque_mode!r}. base_tam_fusion checkpoints "
+                f"need one runtime per stream plus the history_fusion weights."
+            )
+        return runtime
 
     @property
     def history_torque_mode(self) -> str:

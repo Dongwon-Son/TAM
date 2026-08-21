@@ -57,6 +57,15 @@ def configure_jax_persistent_cache(
     they ask JAX to persist even small executables, which helps repeated short
     startup/warmup runs hit the cache instead of recompiling.
     """
+    if isinstance(cache_dir, str) and cache_dir == "auto":
+        # Default persistent-cache location so repeated deploy runs skip the
+        # multi-second JIT warm-up. SIMADAPTOR_JAX_CACHE_DIR overrides; an
+        # empty value disables caching.
+        env = os.environ.get("SIMADAPTOR_JAX_CACHE_DIR")
+        if env is not None:
+            cache_dir = env or None
+        else:
+            cache_dir = Path.home() / ".cache" / "simadaptor" / "jax"
     cache_path = normalize_jax_cache_dir(cache_dir)
     if cache_path is None:
         return None

@@ -131,7 +131,7 @@ class RealTimeHistoryAdaptor:
         expected_dt: float = 0.001,
         attention_history_s: float | None = DEFAULT_DEPLOY_ATTENTION_HISTORY_S,
         max_stream_gap_s: float = 2.0,
-        jax_cache_dir: str | Path | None = None,
+        jax_cache_dir: str | Path | None = "auto",
         jax_cache_min_compile_time_s: float = 0.0,
         jax_cache_min_entry_size_bytes: int = -1,
         jax_cache_xla_caches: str | None = DEFAULT_HISTORY_JAX_CACHE_XLA_CACHES,

@@ -339,6 +339,27 @@ class RealTimeHistoryAdaptor:
         """The adaptor MLP in the controller-side C++ binary format."""
         return self._inf.export_simadaptor_weights_bytes()
 
+    def push_history_samples(self, samples) -> jnp.ndarray | None:
+        """:meth:`push_window` for controller history samples.
+
+        ``samples`` is an iterable of objects with ``t``, ``q``, ``dq`` and
+        ``tau_cmd`` (gravity-free commanded torque) attributes, plus
+        ``gravity`` when the checkpoint's ideal model includes gravity —
+        e.g. robot-control-stack's ``TAMHistorySample``. Returns the latest
+        embedding when one or more tokens were generated, else None.
+        """
+        samples = list(samples)
+        if not samples:
+            return None
+        t = np.asarray([s.t for s in samples], dtype=np.float64)
+        q = np.asarray([s.q for s in samples], dtype=np.float32)
+        dq = np.asarray([s.dq for s in samples], dtype=np.float32)
+        tau_cmd = np.asarray([s.tau_cmd for s in samples], dtype=np.float32)
+        gravity = None
+        if hasattr(samples[0], "gravity"):
+            gravity = np.asarray([s.gravity for s in samples], dtype=np.float32)
+        return self.push_window(t, q, dq, tau_cmd, gravity=gravity)
+
     def reset(self) -> None:
         """Reset streaming buffers and decoder cache (e.g., after a controller reset)."""
         self._cache = self._init_cache(batch_size=1)

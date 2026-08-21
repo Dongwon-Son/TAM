@@ -130,6 +130,7 @@ class RealTimeHistoryAdaptor:
         xml_path: str | Path | None = None,
         expected_dt: float = 0.001,
         attention_history_s: float | None = DEFAULT_DEPLOY_ATTENTION_HISTORY_S,
+        max_stream_gap_s: float = 2.0,
         jax_cache_dir: str | Path | None = None,
         jax_cache_min_compile_time_s: float = 0.0,
         jax_cache_min_entry_size_bytes: int = -1,
@@ -198,6 +199,9 @@ class RealTimeHistoryAdaptor:
                 f"got {attention_history_s}."
             )
         self._attention_history_s = attention_history_s
+        # Holes up to this long are bridged with zero-padded invalid grid
+        # slots; anything longer restarts the stream (see push_window).
+        self._max_stream_gap_s = float(max_stream_gap_s)
         self._attention_history_tokens = attention_history_tokens_from_seconds(
             attention_history_s,
             self._expected_dt,
@@ -448,6 +452,43 @@ class RealTimeHistoryAdaptor:
             raise ValueError(f"qd must have shape [N, {self._dof}], got {qd.shape}")
         if tau.ndim != 2 or tau.shape[1] != self._dof:
             raise ValueError(f"tau must have shape [N, {self._dof}], got {tau.shape}")
+
+        # Stream sanity. The grid reconstruction below already bridges short
+        # holes with zero-padded invalid slots; two cases need a fresh stream:
+        # timestamps moving backwards (the producing timeline restarted, e.g.
+        # the source object was recreated), and holes longer than
+        # max_stream_gap_s (bridging would balloon the dense grid and the
+        # attention context is stale by then anyway).
+        if self._ts_buf.size > 0:
+            buffered_end = float(self._ts_buf[-1])
+            if float(timestamps[-1]) < buffered_end - 0.5:
+                print("[RealTimeHistoryAdaptor] timestamps moved backwards; resetting stream")
+                self.reset()
+            else:
+                fresh = timestamps[timestamps > buffered_end]
+                if fresh.size > 0 and float(fresh[0]) - buffered_end > self._max_stream_gap_s:
+                    print(
+                        f"[RealTimeHistoryAdaptor] {float(fresh[0]) - buffered_end:.2f} s stream gap; resetting stream"
+                    )
+                    self.reset()
+        if self._ts_buf.size == 0:
+            # Fresh stream: if this first window itself spans an over-long
+            # hole, keep only the newest contiguous segment.
+            big = np.nonzero(np.diff(timestamps) > self._max_stream_gap_s)[0]
+            if big.size > 0:
+                cut = int(big[-1]) + 1
+                timestamps = timestamps[cut:]
+                q = q[cut:]
+                qd = qd[cut:]
+                tau = tau[cut:]
+                if gravity is not None:
+                    gravity = np.asarray(gravity, dtype=np.float32)[cut:]
+                if raw_tau is not None:
+                    raw_tau = np.asarray(raw_tau, dtype=np.float32)[cut:]
+                if keep_mask is not None:
+                    keep_mask = np.asarray(keep_mask, dtype=np.float32).reshape(-1)[cut:]
+                if timestamps.shape[0] == 0:
+                    return None
 
         q, qd, tau_model, keep_new = prepare_history_inputs(
             q,

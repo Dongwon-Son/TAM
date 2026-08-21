@@ -43,6 +43,9 @@ where = ["src"]
 include = ["simadaptor*"]
 exclude = ["tests*", "docs*"]
 
+[tool.setuptools.package-data]
+"simadaptor.assets" = ["franka_panda/*.xml", "franka_panda/assets/*"]
+
 [project.optional-dependencies]
 cpu = [
     "jax",

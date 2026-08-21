@@ -202,6 +202,7 @@ class RealTimeHistoryAdaptor:
         # Holes up to this long are bridged with zero-padded invalid grid
         # slots; anything longer restarts the stream (see push_window).
         self._max_stream_gap_s = float(max_stream_gap_s)
+        self._adaptor_weight_bytes: bytes | None = None
         self._attention_history_tokens = attention_history_tokens_from_seconds(
             attention_history_s,
             self._expected_dt,
@@ -336,8 +337,14 @@ class RealTimeHistoryAdaptor:
         return "base_tam_fusion" if "history_fusion" in params else "applied"
 
     def adaptor_weight_bytes(self) -> bytes:
-        """The adaptor MLP in the controller-side C++ binary format."""
-        return self._inf.export_simadaptor_weights_bytes()
+        """The adaptor MLP in the controller-side C++ binary format.
+
+        Computed once and cached: the adaptor weights are immutable for a
+        loaded checkpoint.
+        """
+        if self._adaptor_weight_bytes is None:
+            self._adaptor_weight_bytes = self._inf.export_simadaptor_weights_bytes()
+        return self._adaptor_weight_bytes
 
     def push_history_samples(self, samples) -> jnp.ndarray | None:
         """:meth:`push_window` for controller history samples.

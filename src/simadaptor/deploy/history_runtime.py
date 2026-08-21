@@ -276,6 +276,50 @@ class RealTimeHistoryAdaptor:
     def runtime_bundle(self) -> HistoryRuntimeBundle:
         return self._runtime_bundle
 
+    @classmethod
+    def from_checkpoint(
+        cls,
+        simadaptor_ckpt_path: str | Path | None = None,
+        *,
+        xml_path: str | Path | None = None,
+        **kwargs,
+    ) -> "RealTimeHistoryAdaptor":
+        """Deployment convenience constructor with packaged defaults.
+
+        ``simadaptor_ckpt_path=None`` fetches the default released checkpoint
+        (cached under ``~/.cache/simadaptor``); ``xml_path=None`` uses the
+        packaged ideal-model MJCF. Remaining keyword arguments are forwarded
+        to the regular constructor.
+        """
+        from simadaptor.assets import default_panda_xml, fetch_checkpoint
+
+        if simadaptor_ckpt_path is None:
+            simadaptor_ckpt_path = fetch_checkpoint()
+        if xml_path is None:
+            xml_path = default_panda_xml()
+        return cls(simadaptor_ckpt_path=str(simadaptor_ckpt_path), xml_path=str(xml_path), **kwargs)
+
+    @property
+    def history_torque_mode(self) -> str:
+        """The torque-history mode the loaded checkpoint was trained with.
+
+        ``"applied"`` (a single applied-torque stream) or ``"base_tam_fusion"``
+        (separate base/residual streams combined by a fusion layer; such
+        checkpoints need one runtime per stream plus ``history_fusion``
+        weights).
+        """
+        inf = self._inf
+        for cfg_name in ("dagger_cfg", "cfg"):
+            mode = getattr(getattr(inf, cfg_name, None), "history_torque_mode", None)
+            if mode:
+                return str(mode)
+        params = getattr(inf, "_simadaptor_params", None) or {}
+        return "base_tam_fusion" if "history_fusion" in params else "applied"
+
+    def adaptor_weight_bytes(self) -> bytes:
+        """The adaptor MLP in the controller-side C++ binary format."""
+        return self._inf.export_simadaptor_weights_bytes()
+
     def reset(self) -> None:
         """Reset streaming buffers and decoder cache (e.g., after a controller reset)."""
         self._cache = self._init_cache(batch_size=1)

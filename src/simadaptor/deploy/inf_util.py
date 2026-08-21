@@ -1095,6 +1095,20 @@ class SimAdaptorInference:
         # Dense 1
         self._write_dense(block_params["Dense_1"], f, use_bias=True)
 
+    def export_simadaptor_weights_bytes(self) -> bytes:
+        """Adaptor weights in the controller-side C++ SimAdaptor binary format."""
+        import os
+        import tempfile
+
+        fd, path = tempfile.mkstemp(suffix=".bin")
+        os.close(fd)
+        try:
+            self.export_simadaptor_weights_cpp(path)
+            with open(path, "rb") as f:
+                return f.read()
+        finally:
+            os.unlink(path)
+
     def export_simadaptor_weights_cpp(
         self,
         out_path: str | Path,

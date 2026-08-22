@@ -30,11 +30,20 @@ _RELEASE_BASE = "https://github.com/Dongwon-Son/TAM/releases/download"
 
 # name -> (release tag, tarball, sha256 of the tarball, checkpoint dir inside)
 CHECKPOINTS: dict[str, tuple[str, str, str, str]] = {
+    # Panda-specific TAM, DAgger-finetuned on a real Panda (applied-torque).
     "dagger_applied_8850": (
         "checkpoints-v1",
         "dagger_applied_8850.tar.gz",
         "43fd2715034dd2b9ad86cca5a2f0b1d1b8a4f5948f53395c709159b50be5789e",
         "dagger_applied_8850/checkpoint_8850",
+    ),
+    # Multirobot TAM (sim only; trained on panda_pandagripper, piper,
+    # rby1_onearm, iiwa14, flexiv_rizon4), applied-torque.
+    "multirobot_3472000": (
+        "tam-public-multirobot-ckpt3472000",
+        "tam_public_multirobot_ckpt3472000.tar.gz",
+        "7b587cf3dcd83f5be0f5bbd080f0f63cb49c96b413aad844e1c2510537fef1a1",
+        "tam_public_multirobot_ckpt3472000",
     ),
 }
 

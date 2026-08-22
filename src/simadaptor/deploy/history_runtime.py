@@ -288,10 +288,12 @@ class RealTimeHistoryAdaptor:
     ) -> "RealTimeHistoryAdaptor":
         """Deployment convenience constructor with packaged defaults.
 
-        ``simadaptor_ckpt_path=None`` fetches the default released checkpoint
-        (cached under ``~/.cache/simadaptor``); ``xml_path=None`` uses the
-        packaged ideal-model MJCF. Remaining keyword arguments are forwarded
-        to the regular constructor.
+        ``simadaptor_ckpt_path`` may be a local checkpoint path, the name of a
+        released checkpoint (a key of ``simadaptor.assets.CHECKPOINTS``,
+        fetched into ``~/.cache/simadaptor`` on first use), or ``None`` for
+        the default released checkpoint. ``xml_path=None`` uses the packaged
+        ideal-model MJCF. Remaining keyword arguments are forwarded to the
+        regular constructor.
 
         This entry point builds a **single-stream** runtime, which is only
         correct for ``require_history_torque_mode`` checkpoints (default
@@ -300,10 +302,12 @@ class RealTimeHistoryAdaptor:
         regular constructor (``sim_inf=``/``runtime_bundle=`` sharing). Pass
         ``require_history_torque_mode=None`` to skip the check.
         """
-        from simadaptor.assets import default_panda_xml, fetch_checkpoint
+        from simadaptor.assets import CHECKPOINTS, default_panda_xml, fetch_checkpoint
 
         if simadaptor_ckpt_path is None:
             simadaptor_ckpt_path = fetch_checkpoint()
+        elif isinstance(simadaptor_ckpt_path, str) and simadaptor_ckpt_path in CHECKPOINTS:
+            simadaptor_ckpt_path = fetch_checkpoint(simadaptor_ckpt_path)
         if xml_path is None:
             xml_path = default_panda_xml()
         runtime = cls(simadaptor_ckpt_path=str(simadaptor_ckpt_path), xml_path=str(xml_path), **kwargs)

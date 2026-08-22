@@ -37,12 +37,13 @@ CHECKPOINTS: dict[str, tuple[str, str, str, str]] = {
         "43fd2715034dd2b9ad86cca5a2f0b1d1b8a4f5948f53395c709159b50be5789e",
         "dagger_applied_8850/checkpoint_8850",
     ),
-    # Panda-specific TAM, simulation-trained only (the pre-DAgger model).
+    # Panda-specific TAM, simulation-trained only (the pre-DAgger model; a
+    # single save_dict.pkl bundle, so the checkpoint path is the bundle dir).
     "panda_specific": (
         "checkpoints-v1",
         "panda_specific.tar.gz",
-        "adb6ccccabfa6ba3c733002519a5e049ea621c7da72c1584f9dac010550b1d4b",
-        "panda_specific/checkpoint_960000",
+        "6b47a1f13acdf04fb4b691cfd34976b64e6c047bb22c0e9cf6f32084d94f4c43",
+        "panda_specific",
     ),
 }
 
@@ -88,8 +89,9 @@ def fetch_checkpoint(
 ) -> Path:
     """Return a local checkpoint directory, downloading it on first use.
 
-    The returned path points at the ``checkpoint_<step>`` directory and can be
-    passed directly as ``simadaptor_ckpt_path``. Downloads are verified against
+    The returned path is the checkpoint directory to pass as
+    ``simadaptor_ckpt_path`` (a ``checkpoint_<step>`` dir or a save_dict.pkl
+    bundle, depending on the release). Downloads are verified against
     a pinned SHA-256 and cached; delete the cache directory to force a
     re-download.
     """

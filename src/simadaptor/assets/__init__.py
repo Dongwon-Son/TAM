@@ -47,7 +47,19 @@ CHECKPOINTS: dict[str, tuple[str, str, str, str]] = {
     ),
 }
 
+# The released checkpoint used when none is named. SIMADAPTOR_DEFAULT_CHECKPOINT
+# overrides it without any code change (e.g. =panda_specific).
 DEFAULT_CHECKPOINT = "dagger_applied_8850"
+
+
+def default_checkpoint_name() -> str:
+    name = os.environ.get("SIMADAPTOR_DEFAULT_CHECKPOINT", "").strip()
+    if name and name not in CHECKPOINTS:
+        raise KeyError(
+            f"SIMADAPTOR_DEFAULT_CHECKPOINT={name!r} is not a released checkpoint; "
+            f"available: {sorted(CHECKPOINTS)}"
+        )
+    return name or DEFAULT_CHECKPOINT
 
 
 def default_panda_xml() -> Path:
@@ -84,10 +96,13 @@ def _safe_extract(tar_path: Path, dest: Path) -> None:
 
 
 def fetch_checkpoint(
-    name: str = DEFAULT_CHECKPOINT,
+    name: str | None = None,
     cache_dir: str | os.PathLike | None = None,
 ) -> Path:
     """Return a local checkpoint directory, downloading it on first use.
+
+    ``name`` is a key of :data:`CHECKPOINTS`; ``None`` means the default
+    (``SIMADAPTOR_DEFAULT_CHECKPOINT`` if set, else :data:`DEFAULT_CHECKPOINT`).
 
     The returned path is the checkpoint directory to pass as
     ``simadaptor_ckpt_path`` (a ``checkpoint_<step>`` dir or a save_dict.pkl
@@ -95,6 +110,8 @@ def fetch_checkpoint(
     a pinned SHA-256 and cached; delete the cache directory to force a
     re-download.
     """
+    if name is None:
+        name = default_checkpoint_name()
     if name not in CHECKPOINTS:
         raise KeyError(f"unknown checkpoint {name!r}; available: {sorted(CHECKPOINTS)}")
     tag, filename, sha256, ckpt_subdir = CHECKPOINTS[name]
@@ -133,6 +150,7 @@ def fetch_checkpoint(
 __all__ = [
     "CHECKPOINTS",
     "DEFAULT_CHECKPOINT",
+    "default_checkpoint_name",
     "PANDA_PANDAGRIPPER_XML",
     "default_panda_xml",
     "fetch_checkpoint",
